@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from . import baseline as bl
-from . import faults, watchdog
+from . import analyzer, combo, faults, watchdog
 from .injector import Injector
 from .ledger import REVERTED, Ledger
 from .agents import safety
@@ -65,6 +65,9 @@ async def run_experiment(
     review=None, auto_review=False, graph=None, tier=None,
 ):
     params = faults.validate(cfg, fault, target, duration, params or {})
+    is_combo = fault == faults.COMBO
+    if is_combo:
+        target = combo.target_key(params["parts"])
     base = bl.latest(store)
     if base is None:
         raise faults.ValidationError("no baseline; run `faultline baseline` first")
@@ -78,6 +81,7 @@ async def run_experiment(
             duration = review["final"]["duration_s"]
             params = faults.validate(cfg, fault, target, duration, review["final"]["params"])
     thresholds = base["thresholds"]
+    live = combo.tighten(cfg, thresholds) if is_combo else thresholds
     stop = stop or asyncio.Event()
     db_path = store.path
     ledger = Ledger(store)
@@ -120,7 +124,6 @@ async def run_experiment(
     source = None
     monitor = None
     t_inject = t_revert = None
-    entry_id = None
     try:
         log(f"[{exp_id}] PREFLIGHT")
         t_pre = time.time()
@@ -135,7 +138,7 @@ async def run_experiment(
                 await asyncio.sleep(0.5)
             now = time.time()
             breaches, judged, short = watchdog.judge(
-                rows_since(now - 60), thresholds, now, cfg.preflight.probe_s, cfg.watchdog.min_samples
+                rows_since(now - 60), live, now, cfg.preflight.probe_s, cfg.watchdog.min_samples
             )
             if stop.is_set() or sp.exists():
                 reason, source = "operator stop during preflight", "operator"
@@ -144,19 +147,24 @@ async def run_experiment(
                 source = "preflight"
         if reason is None:
             _update(store, exp_id, state="INJECTING")
-            log(f"[{exp_id}] INJECTING {fault} on {target} for {duration}s")
+            log(f"[{exp_id}] INJECTING {analyzer.fault_label(fault, params) if is_combo else fault + ' on ' + target} for {duration}s")
             try:
-                entry_id = await asyncio.to_thread(
-                    lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject(exp_id, fault, target, params, duration))
-                )
+                if is_combo:
+                    await asyncio.to_thread(
+                        lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject_combo(exp_id, params, duration))
+                    )
+                else:
+                    await asyncio.to_thread(
+                        lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject(exp_id, fault, target, params, duration))
+                    )
             except Exception as e:
                 reason, source = f"inject failed: {type(e).__name__}: {e}", "inject"
         if reason is None:
             t_inject = time.time()
             _update(store, exp_id, state="OBSERVING", injected_at=t_inject)
             log(f"[{exp_id}] OBSERVING")
-            wd = watchdog.Watchdog(thresholds, cfg, t_inject)
-            monitor = safety.Monitor(cfg, db_path, base, fault, target, params, duration, context, t_inject, chat=chat, log=lambda m: log(f"[{exp_id}] {m}"))
+            wd = watchdog.Watchdog(live, cfg, t_inject)
+            monitor = safety.Monitor(cfg, db_path, {**base, "thresholds": live}, fault, target, params, duration, context, t_inject, chat=chat, log=lambda m: log(f"[{exp_id}] {m}"))
             monitor.start()
             while time.time() - t_inject < duration:
                 await asyncio.sleep(cfg.watchdog.interval_s)

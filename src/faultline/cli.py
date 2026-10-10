@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import analyzer, combo as combo_mod
 from . import baseline as bl
 from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer, runs as runs_mod
 from .agents import planner as planner_mod
@@ -223,7 +224,17 @@ def _review_line(rec: dict | None) -> str:
     return f"Safety review: {safety_mod.describe_review(rec)}"
 
 
-def _print_experiment(e: dict):
+def _print_parts(e: dict, store):
+    console.print(analyzer.fault_label(e["fault"], e["params"]), markup=False, highlight=False)
+    entries = {(x["kind"], x["target"]): x for x in Ledger(store).all() if x["experiment_id"] == e["id"]} if store else {}
+    for i, p in enumerate(e["params"]["parts"], 1):
+        x = entries.get((p["fault"], p["target"]))
+        console.print(
+            f"  part {i}: {analyzer.part_label(p)}" + (f" (ledger #{x['id']} {x['state']})" if x else ""), markup=False, highlight=False
+        )
+
+
+def _print_experiment(e: dict, store=None):
     t = Table("id", "fault", "target", "state", "recovery s", "abort reason")
     rec = e["recovery_seconds"]
     t.add_row(
@@ -233,6 +244,8 @@ def _print_experiment(e: dict):
         style="red" if e["state"] in ("ABORTED", "VETOED") else "green",
     )
     console.print(t)
+    if e["fault"] == faults.COMBO:
+        _print_parts(e, store)
     if e["preflight_review"]:
         console.print(_review_line(e["preflight_review"]), markup=False, highlight=False)
     console.print(_safety_line(e), markup=False, highlight=False)
@@ -273,7 +286,7 @@ def _run_experiment(store, cfg, fault, target, duration, params, context=None, g
 
 @app.command()
 def experiment(
-    fault: str = typer.Option(..., "--fault", help="crash | delay | spike"),
+    fault: str = typer.Option(None, "--fault", help="crash | delay | spike (not with --combo)"),
     target: str = typer.Option(None, "--target", help="service; spike always targets the whole shop (traffic)"),
     duration: int = typer.Option(..., "--duration", min=1),
     delay_ms: float = typer.Option(200, "--delay-ms"),
@@ -281,10 +294,27 @@ def experiment(
     loss_pct: float = typer.Option(0, "--loss-pct"),
     users: int = typer.Option(50, "--users", help="spike: Locust users to ramp to"),
     spawn_rate: float = typer.Option(25, "--spawn-rate", help="spike: users started per second"),
+    combo: list[str] = typer.Option(
+        None, "--combo",
+        help="combined failure: repeat once per part as fault:target[:key=value,...], e.g. --combo spike:traffic:users=100 --combo delay:quote:delay_ms=50",
+    ),
 ):
-    """Run one guarded fault injection with watchdog, revert, and recovery measurement."""
+    """Run one guarded fault injection (or a declared combination) with watchdog, revert, and recovery measurement."""
     cfg = load_config()
-    if fault == "spike":
+    if combo:
+        if fault or target:
+            console.print("rejected: --combo replaces --fault and --target", markup=False)
+            raise typer.Exit(2)
+        try:
+            fault, params = faults.COMBO, {"parts": [combo_mod.parse(x) for x in combo]}
+            target = combo_mod.target_key(faults.validate(cfg, fault, "", duration, params)["parts"])
+        except faults.ValidationError as e:
+            console.print(f"rejected: {e}", markup=False)
+            raise typer.Exit(2)
+    elif not fault:
+        console.print("rejected: --fault or --combo is required", markup=False)
+        raise typer.Exit(2)
+    elif fault == "spike":
         target = target or faults.TRAFFIC
         params = {"users": users, "spawn_rate": spawn_rate}
     else:
@@ -300,7 +330,7 @@ def experiment(
     except Exception:
         pass
     e = _run_experiment(store, cfg, fault, target, duration, params, context, gmap, review=True)
-    _print_experiment(e)
+    _print_experiment(e, store)
     raise typer.Exit(0 if e["state"] == "COMPLETED" else 1)
 
 
@@ -405,8 +435,7 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
     t.columns[7].overflow = "fold"
     for i, s in enumerate(res.ranked, 1):
         c = s.candidate
-        params = ",".join(f"{k}={v:g}" for k, v in c.params.items() if v) or "-"
-        t.add_row(str(i), c.id, c.target, c.fault, f"{params} {c.duration_s}s", f"{s.det_score:.2f}", str(s.llm_rank or "-"), s.reason)
+        t.add_row(str(i), c.id, c.target, c.fault, f"{planner_mod.params_text(c)} {c.duration_s}s", f"{s.det_score:.2f}", str(s.llm_rank or "-"), s.reason)
     console.print(t)
     for x in res.exclusions:
         console.print(f"memory: excluded {x['candidate']}: {x['reason']}", markup=False, highlight=False)
@@ -418,7 +447,7 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
     if pick:
         hyp, blast = planner_mod.hypothesis_for(res, gmap, pick)
         c = pick.candidate
-        console.print(f"selected: {c.fault} {c.target} {c.params or ''} {c.duration_s}s ({c.id})", markup=False)
+        console.print(f"selected: {c.fault} {c.target} {'' if c.fault == faults.COMBO else c.params or ''} {c.duration_s}s ({c.id})", markup=False)
         console.print(f"hypothesis: {hyp}", markup=False)
         console.print(f"predicted blast radius: {', '.join(blast) or 'none'}", markup=False)
         console.print(f"validator: ok ({state['validation'][1]})", markup=False)

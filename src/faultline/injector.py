@@ -1,6 +1,6 @@
 import time
 
-from . import faults
+from . import combo, faults
 from .ledger import REVERT_FAILED, REVERTED, Ledger
 
 
@@ -17,19 +17,42 @@ class Injector:
             raise faults.ValidationError("active faults exist in the ledger; run `faultline stop`")
         expires = time.time() + duration + self.cfg.safety.expiry_margin_s
         entry_id = self.ledger.create(experiment_id, fault, target, params, faults.initial_revert(fault, target), expires)
-        entry = self.ledger.get(entry_id)
         try:
-            snapshot = getattr(self.driver, "snapshot", None)
-            pre = snapshot(entry) if snapshot else None
-            if pre is not None:
-                self.ledger.set_revert(entry_id, pre)
-                entry = self.ledger.get(entry_id)
-            revert = self.driver.apply(entry)
+            self._apply(entry_id)
         except Exception:
             self.revert(entry_id)
             raise
-        self.ledger.mark_applied(entry_id, revert)
         return entry_id
+
+    def inject_combo(self, experiment_id, params, duration) -> list[int]:
+        """Apply the parts of one combined experiment. Every part is written PENDING before any is applied, in the fixed apply order.
+        If a part fails, the parts of this experiment already touched are reverted (own entries only) and the error is raised."""
+        parts = combo.validate(self.cfg, params, duration)["parts"]
+        if self.ledger.open_entries():
+            raise faults.ValidationError("active faults exist in the ledger; run `faultline stop`")
+        expires = time.time() + duration + self.cfg.safety.expiry_margin_s
+        ids = [
+            self.ledger.create(experiment_id, p["fault"], p["target"], p["params"], faults.initial_revert(p["fault"], p["target"]), expires)
+            for p in parts
+        ]
+        try:
+            for entry_id in ids:
+                self._apply(entry_id)
+        except Exception:
+            for entry_id in reversed(ids):
+                self.revert(entry_id)
+            raise
+        return ids
+
+    def _apply(self, entry_id: int):
+        entry = self.ledger.get(entry_id)
+        snapshot = getattr(self.driver, "snapshot", None)
+        pre = snapshot(entry) if snapshot else None
+        if pre is not None:
+            self.ledger.set_revert(entry_id, pre)
+            entry = self.ledger.get(entry_id)
+        revert = self.driver.apply(entry)
+        self.ledger.mark_applied(entry_id, revert)
 
     def revert(self, entry_id: int, retries: int = 3) -> str | None:
         entry = self.ledger.get(entry_id)

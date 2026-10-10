@@ -3,7 +3,9 @@ import math
 import re
 
 from . import baseline as bl
-from .faults import TRAFFIC
+from .faults import COMBO, TRAFFIC
+
+COMBO_SEP = "+"
 
 SPACES = {"\u202f": " ", "\u00a0": " "}
 HYPHENS = {"\u2013": "-", "\u2011": "-", "\u2012": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
@@ -39,13 +41,27 @@ def clamp(x: float) -> float:
 
 
 def fault_kind(fault: str, params: dict) -> str:
-    if fault in ("crash", "spike"):
+    if fault in ("crash", "spike", COMBO):
         return fault
     return "loss" if (params or {}).get("loss_pct", 0) else "delay"
 
 
+def part_label(part: dict) -> str:
+    p, t = part["params"], part["target"]
+    k = fault_kind(part["fault"], p)
+    if k == "crash":
+        return f"crash {t}"
+    if k == "spike":
+        return f"spike {p.get('users', 0):g} users"
+    if k == "loss":
+        return f"loss {t} {p.get('loss_pct', 0):g}%"
+    return f"delay {t} {p.get('delay_ms', 0):g} ms"
+
+
 def fault_label(fault: str, params: dict) -> str:
     k = fault_kind(fault, params)
+    if k == COMBO:
+        return "combo: " + " + ".join(part_label(p) for p in (params or {}).get("parts") or [])
     if k == "crash":
         return "crash"
     if k == "spike":
@@ -80,6 +96,8 @@ def breached(v: dict, th: dict | None) -> bool:
 def mapped_journeys(graph: dict, target: str) -> set[str]:
     """Journeys the map says depend on the target; a traffic spike hits all of them."""
     js = graph.get("journeys") or {}
+    if COMBO_SEP in target:
+        return set().union(*(mapped_journeys(graph, t) for t in target.split(COMBO_SEP)))
     return set(js) if target == TRAFFIC else {j for j, v in js.items() if target in v["services"]}
 
 
@@ -146,7 +164,10 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
         "experiment_id": exp["id"], "round": (rnd or {}).get("round"), "scope": "run" if rnd else "history",
         "tier": (rnd or {}).get("tier"), "candidate_id": (rnd or {}).get("candidate_id"),
         "fault": exp["fault"], "kind": fault_kind(exp["fault"], params), "label": fault_label(exp["fault"], params),
-        "target": exp["target"], "reason": (rnd or {}).get("reason"), "planner_fallback": bool((rnd or {}).get("fallback")),
+        "target": exp["target"], "combo": exp["fault"] == COMBO,
+        "parts": [{"fault": p["fault"], "target": p["target"], "kind": fault_kind(p["fault"], p["params"]), "label": part_label(p)}
+                  for p in (params.get("parts") or [])] if exp["fault"] == COMBO else [],
+        "reason": (rnd or {}).get("reason"), "planner_fallback": bool((rnd or {}).get("fallback")),
         "hypothesis": (rnd or {}).get("hypothesis"), "predicted_blast_radius": blast,
         "predicted_journeys": sorted(pred), "mapped_journeys": sorted(mapped),
         "outcome": exp["state"], "abort_reason": exp.get("abort_reason"), "injected": injected,

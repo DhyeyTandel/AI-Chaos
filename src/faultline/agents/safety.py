@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
-from .. import analyzer, faults, llm, memory
+from .. import analyzer, combo, faults, llm, memory
 from ..baseline import done_ts
 from ..stats import percentile
 from ..store import Store
@@ -42,6 +42,12 @@ SYSTEM = (
     "Reply with one JSON object and nothing else: "
     '{"decision":"continue|abort","reason":"<=200 chars, cite numbers from the input","concern_level":"low|medium|high"}. '
     "Use plain ASCII punctuation, no em dashes."
+)
+
+
+LIVE_COMBO_NOTE = (
+    " This run is a declared combination of several simultaneous faults, so degradation can come from any of them; the limits shown "
+    "are already tightened for combinations. Judge the combined effect, not one part."
 )
 
 
@@ -87,9 +93,13 @@ def build_input(cfg, base: dict, rows, fault, target, params, elapsed, duration,
             f"p95 {_ms(cur['p95_ms'])}; prev10s n={prev['count']} err {_pct(prev['error_rate'])} p95 {_ms(prev['p95_ms'])}; "
             f"limits err {_pct(th['error_rate_max'])} p95 {_ms(th['p95_max_ms'])}"
         )
-    shown = ", ".join(f"{k}={v:g}" for k, v in (params or {}).items() if v) or "none"
+    if fault == faults.COMBO:
+        head = f"Fault: {analyzer.fault_label(fault, params)} (simultaneous parts), elapsed {elapsed:.0f}s of {duration}s\n"
+    else:
+        shown = ", ".join(f"{k}={v:g}" for k, v in (params or {}).items() if v) or "none"
+        head = f"Fault: {fault} on {target}, params {shown}, elapsed {elapsed:.0f}s of {duration}s\n"
     text = (
-        f"Fault: {fault} on {target}, params {shown}, elapsed {elapsed:.0f}s of {duration}s\n"
+        head +
         f"Hypothesis: {context.get('hypothesis') or 'none (manual experiment)'}\n"
         f"Predicted blast radius: {', '.join((context.get('blast_radius') or [])[:12]) or 'none'}\n"
         f"Predicted journeys: {', '.join(predicted) if predicted else 'none'}\n"
@@ -165,7 +175,7 @@ class Monitor:
         user, _ = build_input(cfg, self.base, rows, self.fault, self.target, self.params, elapsed, self.duration, self.context, now)
         timeout = cfg.safety_agent.timeout_s
         out, meta = llm.call_structured(
-            "safety", cfg.llm.safety_model, SafetyOut, SYSTEM, user, timeout_s=timeout, store=store,
+            "safety", cfg.llm.safety_model, SafetyOut, SYSTEM + (LIVE_COMBO_NOTE if self.fault == faults.COMBO else ""), user, timeout_s=timeout, store=store,
             input_summary=f"{self.fault} {self.target} t={elapsed:.0f}/{self.duration}s", chat=self.chat, cache=False,
         )
         error = analyzer.clean(meta["error"]) if meta["error"] else None
@@ -231,6 +241,14 @@ REVIEW_SYSTEM = (
     '{"decision":"approve|reduce|veto","reason":"<=200 chars, cite numbers from the input","reduced_params":{"delay_ms":100}}. '
     "Give reduced_params only for reduce, with only the keys you lower. Use plain ASCII punctuation, no em dashes."
 )
+REVIEW_COMBO_NOTE = (
+    " This plan is a declared combination of several faults applied together as one experiment. Veto rejects the whole combination. "
+    "To reduce, you may lower any part: give reduced_params as "
+    '{"duration_s":15,"parts":[{"index":2,"delay_ms":30}]} where index is the part number in the list and each part may only lower its own '
+    "delay_ms, loss_pct or users; a crash part cannot be lowered, only the shared duration_s can. "
+    "Only outcomes aborted by watchdog or safety_agent are known aborts; operator aborts, preflight, inject or system aborts say nothing about "
+    "the limits of the faults and must not be a reason to veto. A combination is survivable when each part is mild and the limits are far above the baseline."
+)
 MIN_DURATION_S = 10
 PARAM_KEYS = ("delay_ms", "jitter_ms", "loss_pct", "users", "spawn_rate")
 REDUCIBLE = {"crash": ("duration_s",), "delay": ("delay_ms", "duration_s"), "loss": ("loss_pct", "duration_s"), "spike": ("users", "duration_s")}
@@ -243,6 +261,8 @@ class Rejected(ValueError):
 
 def apply_reduction(cfg, fault: str, target: str, duration: float, params: dict, reduced) -> tuple[dict, float]:
     """Validated (params, duration) after a proposed reduction. Raises Rejected unless every changed value is lower."""
+    if fault == faults.COMBO:
+        return _reduce_combo(cfg, duration, params, reduced)
     if not isinstance(reduced, dict) or not reduced:
         raise Rejected("reduce without reduced_params")
     kind = analyzer.fault_kind(fault, params)
@@ -277,8 +297,58 @@ def apply_reduction(cfg, fault: str, target: str, duration: float, params: dict,
     return {k: out[k] for k in PARAM_KEYS if k in out}, new_dur
 
 
+def _reduce_combo(cfg, duration, params, reduced) -> tuple[dict, float]:
+    if not isinstance(reduced, dict) or not reduced:
+        raise Rejected("reduce without reduced_params")
+    parts = [{**p, "params": dict(p["params"])} for p in params["parts"]]
+    new_dur = float(duration)
+    if "duration_s" in reduced:
+        try:
+            v = float(reduced["duration_s"])
+        except (TypeError, ValueError):
+            raise Rejected("duration_s is not a number")
+        if v > new_dur:
+            raise Rejected(f"duration_s {v:g} raises {new_dur:g}")
+        if v < new_dur:
+            if v < MIN_DURATION_S:
+                raise Rejected(f"duration below {MIN_DURATION_S} s")
+            new_dur = v
+    lowered = new_dur < float(duration)
+    items = reduced.get("parts") or []
+    if not isinstance(items, list):
+        raise Rejected("parts must be a list")
+    for item in items:
+        try:
+            i = int(item["index"])
+        except (KeyError, TypeError, ValueError):
+            raise Rejected("part without index")
+        if not 1 <= i <= len(parts):
+            raise Rejected(f"no part {i}")
+        change = {k: v for k, v in item.items() if k != "index"}
+        if "duration_s" in change:
+            raise Rejected("duration_s applies to the whole combination")
+        if not change:
+            continue
+        p = parts[i - 1]
+        p["params"], _ = apply_reduction(cfg, p["fault"], p["target"], new_dur, p["params"], change)
+        lowered = True
+    if not lowered:
+        raise Rejected("no value was lowered")
+    try:
+        out = combo.validate(cfg, {"parts": parts}, new_dur)
+    except faults.ValidationError as e:
+        raise Rejected(str(e))
+    return _norm_parts(out), new_dur
+
+
+def _norm_parts(out: dict) -> dict:
+    return {"parts": [{"fault": p["fault"], "target": p["target"], "params": {k: p["params"][k] for k in PARAM_KEYS if k in p["params"]}} for p in out["parts"]]}
+
+
 def _norm(cfg, fault, target, duration, params) -> dict:
     out = faults.validate(cfg, fault, target, duration, params)
+    if fault == faults.COMBO:
+        return _norm_parts(out)
     return {k: out[k] for k in PARAM_KEYS if k in out}
 
 
@@ -290,17 +360,19 @@ def build_review_input(cfg, store, base: dict, fault, target, duration, params, 
     from .planner import neighbours
 
     context = context or {}
-    nb = neighbours(graph).get(target, set()) if graph else set()
+    targets = set(target.split(analyzer.COMBO_SEP))
+    nb = set().union(*(neighbours(graph).get(t, set()) for t in targets)) if graph else set()
     rows = store.conn.execute(
         "SELECT fault, target, params, state, abort_source, abort_reason FROM experiments WHERE state != 'VETOED' ORDER BY created_at DESC LIMIT 60"
     )
     recent = []
     for r in rows:
-        if r["target"] != target and r["target"] not in nb:
+        rt = set(r["target"].split(analyzer.COMBO_SEP))
+        if not rt & (targets | nb):
             continue
         label = analyzer.fault_label(r["fault"], json.loads(r["params"]))
         out = r["state"] + (f" by {r['abort_source']}" if r["state"] == "ABORTED" and r["abort_source"] else "")
-        recent.append(f"{r['target']}{' (neighbour)' if r['target'] != target else ''} {label} -> {out}")
+        recent.append(f"{r['target']}{'' if rt & targets else ' (neighbour)'} {label} -> {out}")
         if len(recent) == RECENT:
             break
     lines = []
@@ -312,8 +384,16 @@ def build_review_input(cfg, store, base: dict, fault, target, duration, params, 
     kind = analyzer.fault_kind(fault, params)
     mine = [x for x in limits if x["target"] == target]
     known = memory.prompt_text(mine + [x for x in limits if x["target"] != target]) if limits else "none"
+    if fault == faults.COMBO:
+        cl = memory.combo_limits(cfg, store)
+        if cl:
+            known += ("; " if limits else "") + "; ".join(f"combo {x['label']} ({x['experiment_id']})" for x in cl[:memory.PROMPT_MAX])
+        listed = "; ".join(f"[{i}] {analyzer.part_label(p)}" for i, p in enumerate(params["parts"], 1))
+        planned = f"Planned fault: combo of {len(params['parts'])} simultaneous faults, duration {duration:g}s, tier {tier if tier else 'n/a'}: {listed}\n"
+    else:
+        planned = f"Planned fault: {analyzer.fault_label(fault, params)} ({kind}) on {target}, duration {duration:g}s, tier {tier if tier else 'n/a'}\n"
     return (
-        f"Planned fault: {analyzer.fault_label(fault, params)} ({kind}) on {target}, duration {duration:g}s, tier {tier if tier else 'n/a'}\n"
+        planned +
         f"Hypothesis: {context.get('hypothesis') or 'none (manual experiment)'}\n"
         f"Predicted blast radius: {', '.join((context.get('blast_radius') or [])[:12]) or 'none'}\n"
         f"Predicted journeys: {', '.join(context.get('predicted_journeys') or []) or 'none'}\n"
@@ -344,7 +424,7 @@ def preflight_review(cfg, store, base, fault, target, duration, params, tier=Non
         limits = memory.known_limits(cfg, store)
         user = build_review_input(cfg, store, base, fault, target, duration, norm, tier, context, graph, limits)
         out, meta = llm.call_structured(
-            "safety", cfg.llm.safety_model, ReviewOut, REVIEW_SYSTEM, user, timeout_s=cfg.safety_agent.timeout_s, store=store,
+            "safety", cfg.llm.safety_model, ReviewOut, REVIEW_SYSTEM + (REVIEW_COMBO_NOTE if fault == faults.COMBO else ""), user, timeout_s=cfg.safety_agent.timeout_s, store=store,
             input_summary=f"preflight {analyzer.fault_label(fault, norm)} {target}", chat=chat, cache=True,
         )
     except Exception as e:
@@ -370,6 +450,14 @@ def preflight_review(cfg, store, base, fault, target, duration, params, tier=Non
 def _changes(rec: dict) -> str:
     a, b = rec["original"], rec["final"]
     parts = []
+    if "parts" in a["params"]:
+        for pa, pb in zip(a["params"]["parts"], b["params"]["parts"]):
+            for k, unit in (("delay_ms", "ms"), ("loss_pct", "%"), ("users", "users")):
+                if k in pa["params"] and pa["params"][k] != pb["params"].get(k):
+                    parts.append(f"{pa['target']} {k.split('_')[0]} {pa['params'][k]:g} -> {pb['params'][k]:g} {unit}")
+        if a["duration_s"] != b["duration_s"]:
+            parts.append(f"duration {a['duration_s']:g} -> {b['duration_s']:g} s")
+        return ", ".join(parts)
     for k, unit in (("delay_ms", "ms"), ("loss_pct", "%"), ("users", "users")):
         if a["params"].get(k) != b["params"].get(k) and k in a["params"]:
             parts.append(f"{k.split('_')[0]} {a['params'][k]:g} -> {b['params'][k]:g} {unit}")

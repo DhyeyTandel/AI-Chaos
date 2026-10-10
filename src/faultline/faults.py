@@ -6,6 +6,7 @@ import httpx
 from docker.errors import APIError, NotFound
 
 FAULTS = ("crash", "delay", "spike")
+COMBO = "combo"
 TRAFFIC = "traffic"
 LOCUST_URL = "http://load-generator:8089"
 REVERT_SPAWN_RATE = 100
@@ -44,6 +45,12 @@ class ValidationError(ValueError):
 
 def validate(cfg, fault: str, target: str, duration: float, params: dict) -> dict:
     s = cfg.safety
+    if fault == COMBO:
+        from . import combo
+
+        if not 1 <= duration <= s.max_duration_s:
+            raise ValidationError(f"duration must be 1..{s.max_duration_s} seconds")
+        return combo.validate(cfg, params, duration)
     if fault not in FAULTS:
         raise ValidationError(f"unknown fault {fault!r}; allowed: {', '.join(FAULTS)}")
     if fault == "spike":

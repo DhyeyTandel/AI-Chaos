@@ -1,10 +1,11 @@
 import json
+from itertools import combinations
 
 from pydantic import BaseModel, Field, field_validator
 
 from .. import analyzer
 from .. import baseline as bl
-from .. import faults, llm, memory
+from .. import combo, faults, llm, memory
 from ..mapper import INFRA, TOOLING
 
 NOISE = INFRA | TOOLING | {"flagd-ui", "grafana", "opensearch"}
@@ -101,6 +102,8 @@ def assign_tier(cfg, graph: dict, c: Candidate) -> int:
     over = vars(t.overrides).get(c.id)
     if over:
         return int(over)
+    if c.fault == faults.COMBO:
+        return int(cfg.combined.tier)
     if c.fault == "spike":
         return int(cfg.planner.spike_tier)
     if c.fault == "crash":
@@ -147,6 +150,52 @@ def generate_candidates(cfg, graph: dict) -> list[Candidate]:
     return out
 
 
+def _matches(c: Candidate, e: dict) -> bool:
+    if c.fault == "crash":
+        return e["fault"] == "crash" and e["target"] == c.target
+    return e["fault"] == c.fault and e["target"] == c.target and all(e["params"].get(k) == v for k, v in c.params.items() if k != "duration_s")
+
+
+def survived_singles(store, limit: int = 200) -> list[dict]:
+    rows = store.conn.execute(
+        "SELECT fault, target, params FROM experiments WHERE state = 'COMPLETED' AND fault != ? ORDER BY created_at DESC LIMIT ?",
+        (faults.COMBO, limit),
+    )
+    return [{"fault": r["fault"], "target": r["target"], "params": json.loads(r["params"])} for r in rows]
+
+
+def combo_candidates(cfg, store, singles: list[Candidate]) -> list[Candidate]:
+    """Pairs of tier 1 or 2 singles that each already completed on their own, kept when the pair passes combo validation."""
+    c = cfg.combined
+    if not (c.enabled and c.planner):
+        return []
+    done = survived_singles(store)
+    pool = sorted(
+        (s for s in singles if s.fault != faults.COMBO and s.tier <= 2 and any(_matches(s, e) for e in done)), key=lambda s: s.id
+    )
+    out = []
+    for a, b in combinations(pool, 2):
+        pair = [{"fault": x.fault, "target": x.target, "params": dict(x.params)} for x in (a, b)]
+        duration = max(a.duration_s, b.duration_s)
+        try:
+            combo.validate(cfg, {"parts": pair}, duration)
+        except faults.ValidationError:
+            continue
+        ids = {id(p): x.id for p, x in zip(pair, (a, b))}
+        parts = combo.order(pair)
+        out.append(Candidate(
+            id="combo:" + "+".join(ids[id(p)] for p in parts), fault=faults.COMBO, kind="combo", target=combo.target_key(parts),
+            params={"parts": parts}, duration_s=int(duration), label=analyzer.fault_label(faults.COMBO, {"parts": parts}), tier=int(c.tier),
+        ))
+    return out
+
+
+def params_text(c: Candidate) -> str:
+    if c.fault == faults.COMBO:
+        return f"{len(c.params['parts'])} parts"
+    return ",".join(f"{k}={v:g}" for k, v in c.params.items() if v) or "-"
+
+
 def history(store, limit: int) -> list[dict]:
     rows = store.conn.execute("SELECT * FROM experiments WHERE state != 'VETOED' ORDER BY created_at DESC LIMIT ?", (limit,))
     out = []
@@ -186,6 +235,8 @@ def dependents(graph: dict, target: str) -> list[str]:
 
 def score_candidates(cfg, graph: dict, hist: list[dict], cands: list[Candidate]) -> list[Scored]:
     w, sev = cfg.planner.weights, cfg.planner.severity
+    combo_hist = [e for e in hist if e["fault"] == faults.COMBO]
+    hist = [e for e in hist if e["fault"] != faults.COMBO]
     fan = {n: len({e["source"] for e in graph["edges"] if e["target"] == n}) for n in graph["nodes"]}
     max_fan = max(fan.values(), default=0) or 1
     journeys = graph.get("journeys") or {}
@@ -198,6 +249,9 @@ def score_candidates(cfg, graph: dict, hist: list[dict], cands: list[Candidate])
     for c in cands:
         node = graph["nodes"].get(c.target, {})
         pj = {k: v for k, v in c.params.items() if k != "duration_s"}
+        if c.fault == faults.COMBO:
+            out.append(_score_combo(cfg, graph, c, combo_hist, fan, max_fan, journeys))
+            continue
         if c.fault == "crash":
             same = any(f == "crash" and t == c.target for f, t, _ in tested_pairs)
         else:
@@ -227,13 +281,38 @@ def score_candidates(cfg, graph: dict, hist: list[dict], cands: list[Candidate])
     return out
 
 
+def _score_combo(cfg, graph, c: Candidate, combo_hist: list[dict], fan: dict, max_fan: int, journeys: dict) -> Scored:
+    w, sev = cfg.planner.weights, cfg.planner.severity
+    parts = c.params["parts"]
+    sig, key = combo.signature(parts), combo.limit_key(parts)
+    same = any(combo.signature(e["params"].get("parts") or []) == sig for e in combo_hist)
+    pair = any(combo.limit_key(e["params"].get("parts") or []) == key for e in combo_hist)
+    comps = {
+        "fan_in": max(fan.get(p["target"], 0) for p in parts) / max_fan,
+        "journeys_affected": (len(analyzer.mapped_journeys(graph, c.target)) / len(journeys)) if journeys else 0.0,
+        "stateful": 1.0 if any(graph["nodes"].get(p["target"], {}).get("stateful") for p in parts) else 0.0,
+        "untested": 0.0 if same else 0.5 if pair else 1.0,
+        "recent_result": 0.0,
+        "severity": getattr(sev, "combo", 0.9),
+    }
+    total = (
+        w.fan_in * comps["fan_in"] + w.journeys * comps["journeys_affected"] + w.stateful * comps["stateful"]
+        + w.untested * comps["untested"] + w.recent * comps["recent_result"] + w.severity * comps["severity"]
+    )
+    return Scored(candidate=c, det_score=round(total, 3), components={k: round(v, 3) for k, v in comps.items()})
+
+
 def select_top(cfg, scored: list[Scored], top_k: int) -> list[Scored]:
     order = {c.id: i for i, c in enumerate(sorted((s.candidate for s in scored), key=lambda c: c.id))}
     ranked = sorted(scored, key=lambda s: (-s.det_score, order[s.candidate.id]))
-    cap, per, top = cfg.planner.max_per_target, {}, []
+    cap, per, top, combos = cfg.planner.max_per_target, {}, [], 0
     for s in ranked:
         if per.get(s.candidate.target, 0) >= cap:
             continue
+        if s.candidate.fault == faults.COMBO:
+            if combos >= cfg.combined.max_per_plan:
+                continue
+            combos += 1
         per[s.candidate.target] = per.get(s.candidate.target, 0) + 1
         top.append(s)
         if len(top) == top_k:
@@ -247,6 +326,8 @@ def template_reason(s: Scored) -> str:
     if c["stateful"]:
         parts.append("stateful")
     parts.append({1.0: "untested", 0.5: "target tested with another fault", 0.0: "already tested"}[c["untested"]])
+    if s.candidate.fault == faults.COMBO:
+        parts.append("pair of singles that each survived")
     if c["recent_result"] > 0:
         parts.append("neighbour degraded earlier")
     elif c["recent_result"] < 0:
@@ -262,14 +343,18 @@ def journey_callers(graph: dict, target: str) -> list[str]:
 
 def blast_radius(graph: dict, target: str) -> list[str]:
     js = [f"journey:{j}" for j in sorted(analyzer.mapped_journeys(graph, target))]
-    return journey_callers(graph, target) + js
+    callers = list(dict.fromkeys(x for t in target.split(analyzer.COMBO_SEP) for x in journey_callers(graph, t)))
+    return callers + js
 
 
 def template_hypothesis(graph: dict, c: Candidate) -> str:
-    deps = journey_callers(graph, c.target)
+    deps = [x for x in blast_radius(graph, c.target) if not x.startswith("journey:")]
     js = sorted(analyzer.mapped_journeys(graph, c.target))
-    what = TEMPLATE_FAULT["loss" if c.kind == "loss" else c.fault]
-    head = f"If {c.target} {what} ({c.label})" if c.fault != "spike" else f"If the shop {what} ({c.label})"
+    if c.fault == faults.COMBO:
+        head = f"If these faults hit together ({c.label.removeprefix('combo: ')})"
+    else:
+        what = TEMPLATE_FAULT["loss" if c.kind == "loss" else c.fault]
+        head = f"If {c.target} {what} ({c.label})" if c.fault != "spike" else f"If the shop {what} ({c.label})"
     if not js:
         return f"{head}, no user journey depends on it; expect no journey to degrade."
     callers = f"callers on those journeys ({', '.join(deps[:6])}) will show errors or higher latency and " if deps else ""
@@ -355,9 +440,15 @@ def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier:
          exclude=(), strategy: str | None = None) -> PlanResult:
     top_k = top_k or cfg.planner.top_k
     hist = history(store, cfg.planner.history)
-    cands = [c for c in generate_candidates(cfg, graph) if (max_tier is None or c.tier <= max_tier) and c.target not in exclude]
+    every = generate_candidates(cfg, graph)
+    cands = [c for c in every if (max_tier is None or c.tier <= max_tier) and c.target not in exclude]
     limits = memory.known_limits(cfg, store)
     cands, excluded = memory.exclusions(cands, limits)
+    if max_tier is None or max_tier >= cfg.combined.tier:
+        pool, _ = memory.exclusions(every, limits)
+        combos = [c for c in combo_candidates(cfg, store, pool) if c.target not in exclude]
+        combos, combo_out = memory.combo_exclusions(combos, memory.combo_limits(cfg, store))
+        cands, excluded = cands + combos, excluded + combo_out
     scored = score_candidates(cfg, graph, hist, cands)
     top = select_top(cfg, scored, top_k)
     model = cfg.llm.planner_model

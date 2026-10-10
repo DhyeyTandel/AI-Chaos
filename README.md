@@ -69,6 +69,7 @@ All commands run as `docker compose run --rm faultline <command>`.
 | `map` | Build the dependency map and journeys, print hidden-dependency candidates and a Mermaid graph |
 | `baseline [--seconds N] [--warmup N] [--show]` | Measure steady state and derive watchdog thresholds |
 | `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]`, or `experiment --fault spike --duration S [--users N] [--spawn-rate R]` | One guarded fault: pre-flight safety review, then watchdog, revert and recovery measurement |
+| `experiment --combo PART --combo PART --duration S`, with `PART` = `fault:target[:key=value,...]` | Combined failure: two declared faults applied together as one experiment, e.g. `experiment --combo spike:traffic:users=100 --combo delay:quote:delay_ms=50 --duration 30`. Parts: `spike:traffic:users=N[,spawn_rate=R]`, `delay:SVC:delay_ms=N[,jitter_ms=N]`, `loss:SVC:loss_pct=N`, `crash:SVC` |
 | `plan [--top N]` | Rank candidate faults and validate the pick, without running it; lists candidates excluded by learned limits |
 | `run [--rounds N] [--report]` | Autonomous loop: plan, validate, execute, record, climb the risk ladder (1 to 8 rounds, default 3) |
 | `runs show [RUN_ID]` | Print a stored run with hypotheses, pre-flight reviews, vetoes, exclusions and safety-agent decisions |
@@ -106,6 +107,16 @@ Faults are never applied without these layers in place. Each is independent of t
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
 | Reaper | Separate always-on container; reverts faults past expiry, or all faults if the controller heartbeat is older than 10 s (measured live: 13 s) |
 | Self-expiring netem sidecar | The network fault removes its own rule when its TTL ends (verified with both controller and reaper stopped) |
+
+**Combined failures** (`experiment --combo`, `[combined]` in `faultline.toml`) are always declared, never an accidental overlap. A combo is one experiment id with 2 parts (`max_parts`), applied in a fixed order (spike, then delay or loss, crash last), under the same layers:
+
+- Validation: every part passes the normal allowlist and caps; parts must target different things; at most one crash; each pair must be in `allowed_pairs` (default spike+delay, spike+loss, spike+crash, delay+delay, delay+crash); stateful and flagd targets (`crash_deny`) are never crashed inside a combo.
+- Tighter limits: every journey's p95 and error-rate limit is multiplied by 0.8 for the whole combo (preflight, watchdog and live safety checks). Recovery is judged against the normal baseline band.
+- Ledger: one entry per part, all written PENDING before the first apply. If a later part fails to apply, the earlier parts of that experiment are reverted and the experiment fails cleanly. A kill switch, abort or reaper reverts all parts as ordinary entries.
+- Safety review: one review for the whole combo. It may veto it, or lower any part's intensity or the shared duration, never raise.
+- Memory: a combo aborted by the watchdog or safety agent records a combo limit keyed by the sorted pair of parts. It never becomes a single-fault limit, and singles stay proposable.
+- Planner: at tier 3 only (`[combined] planner`), up to 3 combo candidates built from pairs of tier 1 or 2 singles that each already completed. Scored deterministically like other candidates.
+- Report: labelled `combo: spike 100 users + delay quote 50 ms`, scored once as one experiment, listed part by part in the "Combined failures" section; hidden dependencies are attributed to the combo, not to a part.
 
 Crashes hold the container restart policy at `no` during the fault and restore it afterwards.
 
@@ -163,7 +174,7 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Cross-run planner memory and learned limits | Done |
 | Auto-apply of proposed fixes | Future |
 | Dashboard | Future |
-| Combined (multi-fault) failures | Future |
+| Combined (multi-fault) failures | Done (`experiment --combo`, planner combos at tier 3) |
 | Full-disk and database-overload faults | Future |
 
 ## Repository layout

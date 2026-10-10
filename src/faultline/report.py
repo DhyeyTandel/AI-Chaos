@@ -69,6 +69,7 @@ def methodology_text(cfg) -> list[str]:
         "An independent synthetic prober exercises four user journeys (home, product, cart, checkout) through the front proxy every second. It is the ground truth and does not depend on the application's own telemetry.",
         "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober. Before injection, the safety agent reviews the plan against the baseline limits, recent outcomes and the learned limits, and may approve it, reduce its intensity or veto it; it can never raise an intensity. The planner remembers, across runs, the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose that intensity or a higher one again within the lookback window. An advisory safety agent re-checks the live measurements every few seconds and may abort earlier; it can never cancel a watchdog abort, extend a fault or change a threshold.",
         "Each experiment injects one fault (container crash, added network delay, packet loss or a traffic spike), measures every journey during the fault window (up to the abort for aborted runs), reverts the fault, and measures how long the journeys take to return inside the baseline band.",
+        f"A declared combined failure injects {cfg.combined.max_parts} faults together as one experiment (one ledger entry per part, one watchdog, one safety review). Every journey limit is tightened for it: p95 limit x{cfg.combined.p95_factor:g}, error-rate limit x{cfg.combined.error_factor:g}. It is scored once, as a whole.",
         "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
         f"A hidden dependency is a journey that degraded by at least {cfg.score.hidden_min_impact} although neither the hypothesis nor the dependency map expected it.",
         "The analyst agent ranks weaknesses and the fixer agent proposes fixes from the measured results only; their output is validated against known experiments, services and an allowlist of compose keys. When Groq is unavailable or its output is invalid, rule-based fallbacks produce the same sections. Fixes are proposals and are never applied.",
@@ -93,7 +94,7 @@ def rating(score) -> str:
     return "n/a" if score is None else "good" if score >= 80 else "fair" if score >= 60 else "poor"
 
 
-def learned_limits(cfg, run: dict, analysis: dict) -> dict:
+def learned_limits(cfg, store, run: dict, analysis: dict) -> dict:
     mem = run.get("memory") or {}
     new = [
         {"experiment_id": a["experiment_id"], "target": a["target"], "fault": a["label"], "source": a["abort_source"]}
@@ -103,6 +104,7 @@ def learned_limits(cfg, run: dict, analysis: dict) -> dict:
     return {
         "enabled": memory.enabled(cfg), "lookback_days": cfg.planner.memory.lookback_days,
         "limits": mem.get("limits") or [], "exclusions": mem.get("exclusions") or [], "new": new,
+        "combo_limits": memory.combo_limits(cfg, store),
     }
 
 
@@ -127,7 +129,7 @@ def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res
         "services": analysis["services"], "untested_services": analysis["untested"],
         "score_config": {k: v for k, v in vars(cfg.score).items()}, "formula": analyzer.formula_text(cfg),
         "methodology": methodology_text(cfg), "ai_usage": ai_usage(store, run, since, results),
-        "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, run, analysis),
+        "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, store, run, analysis),
         "notes": {
             "analyst_dropped": analyst_res.dropped, "fixer_filled_by_fallback": fixer_res.filled,
             "recovery_not_measured": [a["experiment_id"] for a in analysis["experiments"] if a["injected"] and not a["recovery_measured"]],
@@ -168,6 +170,9 @@ def blocks(cfg, d: dict) -> list:
               [[a["round"], a["tier"], a["label"], a["target"], cut(a["reason"], 140), cut(a["hypothesis"], 140), a["verdict"],
                 ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", cut(safety.describe_review(a["preflight"]), 120), safety.describe(a["safety_decisions"]),
                 a["outcome"] + (f" by {a['abort_source']}" if a["abort_source"] else "") + (f" ({cut(a['abort_reason'], 60)})" if a["abort_reason"] else "")] for a in run_exps]))
+    combos = [a for a in d["experiments"] if a["combo"]]
+    if combos:
+        b += combo_blocks(cfg, combos)
     if d["preflight"]["vetoed"]:
         b.append(("p", "Vetoed by the pre-flight safety review (not injected, not counted as aborts): " + "; ".join(
             f"round {v['round']} {v['candidate']} ({cut(v['reason'], 120)})" for v in d["preflight"]["vetoed"])))
@@ -202,6 +207,17 @@ def blocks(cfg, d: dict) -> list:
     return b
 
 
+def combo_blocks(cfg, combos: list[dict]) -> list:
+    c = cfg.combined
+    b: list = [("h", 2, "Combined failures", "")]
+    b.append(("p", f"Each row is one experiment with several faults applied together. Journey limits were tightened (p95 x{c.p95_factor:g}, error rate x{c.error_factor:g}). "
+                   "Impact, breadth and recovery are measured once for the whole combination, and hidden dependencies are attributed to the combination, never to a single part."))
+    b.append(("table", ["Experiment", "Combination", "Parts", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Outcome"],
+              [[a["experiment_id"], a["label"], "; ".join(f"{i}. {p['label']}" for i, p in enumerate(a["parts"], 1)), ", ".join(a["affected_journeys"]) or "none",
+                f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", a["outcome"]] for a in combos]))
+    return b
+
+
 def learned_blocks(m: dict) -> list:
     b: list = [("h", 2, "Learned limits", "")]
     if not m["enabled"]:
@@ -216,7 +232,12 @@ def learned_blocks(m: dict) -> list:
         b += [("p", "Candidates excluded during this run:"), ("table", ["Candidate", "Reason", "Evidence"],
               [[x["candidate"], x["reason"], x["evidence"]] for x in m["exclusions"]])]
     if m["new"]:
-        b.append(("p", "New limits learned in this run: " + "; ".join(f"{x['fault']} on {x['target']} aborted by {x['source']} ({x['experiment_id']})" for x in m["new"]) + "."))
+        b.append(("p", "New limits learned in this run: " + "; ".join(
+            f"{x['fault']}{'' if x['fault'].startswith('combo') else ' on ' + x['target']} aborted by {x['source']} ({x['experiment_id']})" for x in m["new"]) + "."))
+    if m.get("combo_limits"):
+        b += [("p", "Combined failure limits, keyed by the sorted pair of parts. A combination at or above these levels on every part is not proposed; single-fault limits are unaffected."),
+              ("table", ["Pair", "Aborted combination", "Aborted by", "Evidence"],
+               [[x["key"], x["label"], x["source"], x["experiment_id"]] for x in m["combo_limits"]])]
     return b
 
 

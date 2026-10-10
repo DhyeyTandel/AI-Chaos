@@ -101,6 +101,7 @@ Layers are independent: a failure of one (including the LLM) does not remove the
 | Kill switch | Operator wants everything undone now | Live: `faultline stop` plus STOP sentinel |
 | Reaper | Controller crash or hang; expired faults | Live: reverted stale-heartbeat faults (measured 13 s) |
 | Self-expiring netem sidecar | Controller and reaper both dead | Live: rule removed at TTL with both stopped |
+| Combined-failure rules | A declared combo of two faults: allowed pairs, one crash at most, distinct targets, limits x0.8, all parts in the ledger before any apply, revert of earlier parts if a later one fails | Unit tests (`tests/test_combo.py`); live: spike + delay, refusal, kill switch |
 
 ## Data flow
 
@@ -131,4 +132,5 @@ SQLite (a Docker volume) holds probe samples, baselines, the ledger, the control
 | Groq free tier with a token limiter, daily budget and cache | The tool must run on a free key, and still run (deterministically) without one |
 | Pinned upstream app via git submodule, tweaks in `compose.override.yaml` | Reproducible results; no edits under `vendor/` |
 | Thresholds derived from a measured baseline, with floors | Avoids tripping on normal noise and avoids a limit too loose to protect anything |
+| A combo is one experiment with one ledger entry per part | Reuses the single-experiment watchdog, review, kill switch, reaper and `revert_experiment` unchanged; the report and memory score it as a unit, never as separate single faults |
 | Fixes are proposed, not applied | Keeps a human in the loop; auto-apply is future work |

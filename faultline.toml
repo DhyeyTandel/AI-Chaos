@@ -115,6 +115,7 @@ severity = 0.5            # fault strength, see [planner.severity]
 
 [planner.severity]
 crash = 1.0
+combo = 0.9
 spike = 0.7
 delay300 = 0.6
 loss = 0.5
@@ -131,6 +132,18 @@ critical = ["flagd"]      # extra targets whose crash is always tier 3 (flagd: h
 # core paths call these many times per request, so even small delays multiply
 "delay:frontend:50ms" = 2
 "delay:product-catalog:50ms" = 2
+
+[combined]
+# declared combined failures: `faultline experiment --combo ... --combo ...` applies the parts together as one experiment
+enabled = true            # false refuses every combo and removes combo candidates from the planner
+planner = true            # the planner may propose combos, only at tier 3, built from singles that already survived
+max_parts = 2             # most faults in one combo (2 or more)
+allowed_pairs = ["spike+delay", "spike+loss", "spike+crash", "delay+delay", "delay+crash"]   # every pair of parts must be listed (order does not matter)
+crash_deny = ["astronomy-db", "flagd", "kafka", "valkey-cart"]   # tier 3 targets: never crashed inside a combo (at most one crash per combo anyway)
+p95_factor = 0.8          # a combo aborts at this share of each journey's p95 limit
+error_factor = 0.8        # and of each journey's error-rate limit
+max_per_plan = 3          # combo candidates kept in the planner's top-k
+tier = 3                  # risk tier of every combo candidate
 
 [run]
 # `faultline run`: start at tier 1, climb one tier after climb_after survived experiments at the current tier
