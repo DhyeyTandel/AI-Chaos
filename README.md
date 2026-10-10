@@ -161,13 +161,15 @@ Token budget handling: a per-model limiter (8000 tokens/min), a daily budget per
 
 ## Sample results
 
-From live runs on a Codespace-sized host (see `reports/sample/` for a full report):
+From live runs on an 8-core Linux host (see `reports/sample/` for the full report of run-201605-9bf7, 4 rounds, all four agents on Groq):
 
-- **Risk ladder.** One run climbed from tier 1 to tier 2: 50 ms delays on astronomy-db and frontend-proxy completed, then a crash of cart was aborted by the watchdog at cart p95 3007 ms (recovery 6 s).
-- **Hidden dependency.** Crashing flagd, which is on no journey in the map, pushed cart p95 to about 3 s.
+- **The sample run.** Round 1: a 50 ms delay on flagd was aborted by the Safety agent ("product p95 221 ms > baseline 132 ms, outside predicted blast radius") before any threshold was breached. Rounds 2 and 3: 50 ms delays on frontend-proxy and cart completed, so the ladder climbed to tier 2. Round 4: a 300 ms delay on valkey-cart was aborted by the watchdog at cart p95 2156 ms. Every fault was reverted; recovery took about 5 s each.
+- **Hidden dependency.** flagd (feature flags) is on no journey in the map, yet a crash pushed cart p95 to about 3 s and even a 50 ms delay slowed the product page. It is the most repeated finding across runs.
 - **Latency without errors.** 10 % packet loss on currency raised checkout p95 from 74 ms to 410 ms with zero errors.
-- **Pre-flight review and memory.** In the sample run the planner already knew seven learned limits (for example delay on astronomy-db aborted at 50 ms), and the safety review reduced one of the two executed candidates and approved the other.
-- **Score.** The sample report scores the shop 39.6 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on. A recovery at the measurement floor (about 5 s) is never reported as a weakness, and an experiment stopped by the operator before recovery was measured contributes no recovery component instead of counting as never recovered.
+- **Traffic spike.** 100 Locust users raised checkout p95 from 37 ms to 163 ms; the spike was reverted by the experiment, and separately by the kill switch in a test.
+- **Pre-flight review and memory.** The planner excludes intensities that already aborted (for example delay on product-catalog at 100 ms), and the Safety review vetoed a 300 ms delay on product-catalog before injection.
+- **Fix verification.** Auto-applied memory raises (frontend, quote) gave NO CHANGE or noise-level differences and were reverted: the top weaknesses need code-level fixes (timeouts, circuit breakers), which the Fixer proposes but does not apply.
+- **Score.** The sample report scores the shop 44.2 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on. A recovery at the measurement floor (about 5 s) is never reported as a weakness, and an experiment stopped by the operator before recovery was measured contributes no recovery component instead of counting as never recovered.
 
 ## Status
 
