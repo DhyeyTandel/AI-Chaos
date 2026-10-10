@@ -81,7 +81,7 @@ max_attempts = 3          # ranked candidates tried before giving up on validati
 max_per_target = 2        # diversity cap inside the top-k
 duration_s = 20           # delay-fault duration
 crash_duration_s = 20     # crash-fault duration
-delay_ms = [100, 300]     # delay intensity menu
+delay_ms = [50, 300]      # delay intensity menu
 loss_pct = [10]           # packet-loss intensity menu (with 1 ms delay)
 exclude = []              # extra targets the planner never proposes (allowlist is [safety].allow)
 history = 10              # past experiments read for the recent_result component
@@ -99,16 +99,19 @@ severity = 0.5            # fault strength, see [planner.severity]
 crash = 1.0
 delay300 = 0.6
 loss = 0.5
-delay100 = 0.3
+delay50 = 0.2
 
 [planner.tiers]
 # risk ladder, applied to every candidate as `tier` (derived from the map's journeys and stateful flags)
 #   tier 1: delay <= light_delay_ms on any allowed target; crash of a service no journey depends on
 #   tier 2: delay above light_delay_ms (300 ms); packet loss; crash of a service on some but not all journeys
 #   tier 3: crash of a service on every journey, or of a stateful service (data store, broker)
-light_delay_ms = 100      # delays up to this are tier 1, above it tier 2
-critical = []             # extra targets whose crash is always tier 3
-# [planner.tiers.overrides]   # pin one candidate to a tier, e.g. "crash:ad:20s" = 2
+light_delay_ms = 50       # delays up to this are tier 1, above it tier 2
+critical = ["flagd"]      # extra targets whose crash is always tier 3 (flagd: hidden dependency, crash made cart p95 3s)
+[planner.tiers.overrides]     # pin one candidate to a tier
+# core paths call these many times per request, so even small delays multiply
+"delay:frontend:50ms" = 2
+"delay:product-catalog:50ms" = 2
 
 [run]
 # `faultline run`: start at tier 1, climb one tier after climb_after survived experiments at the current tier
