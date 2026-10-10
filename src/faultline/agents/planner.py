@@ -20,6 +20,7 @@ class Candidate(BaseModel):
     params: dict
     duration_s: int
     label: str
+    tier: int = 1
 
 
 class Scored(BaseModel):
@@ -69,6 +70,22 @@ def load_map(cfg, overrides_path, out_path) -> dict:
     return mapper.build_map(cfg, overrides_path, p)
 
 
+def assign_tier(cfg, graph: dict, c: Candidate) -> int:
+    t = cfg.planner.tiers
+    over = vars(t.overrides).get(c.id)
+    if over:
+        return int(over)
+    if c.fault == "crash":
+        journeys = graph.get("journeys") or {}
+        hit = sum(1 for v in journeys.values() if c.target in v["services"])
+        if graph["nodes"].get(c.target, {}).get("stateful") or c.target in t.critical or (journeys and hit == len(journeys)):
+            return 3
+        return 2 if hit else 1
+    if c.kind == "loss":
+        return 2
+    return 1 if c.params.get("delay_ms", 0) <= t.light_delay_ms else 2
+
+
 def generate_candidates(cfg, graph: dict) -> list[Candidate]:
     p, s = cfg.planner, cfg.safety
     out = []
@@ -92,6 +109,8 @@ def generate_candidates(cfg, graph: dict) -> list[Candidate]:
                 id=f"loss:{target}:{pct}pct", fault="delay", kind="loss", target=target,
                 params={"delay_ms": 1, "jitter_ms": 0, "loss_pct": pct}, duration_s=p.duration_s, label=f"loss {pct}%",
             ))
+    for c in out:
+        c.tier = assign_tier(cfg, graph, c)
     return out
 
 
@@ -217,7 +236,7 @@ def template_hypothesis(graph: dict, c: Candidate) -> str:
     )
 
 
-def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict]) -> str:
+def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], strategy: str | None = None) -> str:
     nodes = ",".join(n + ("*" if a.get("stateful") else "") for n, a in sorted(graph["nodes"].items()) if a.get("kind") in ("app", "infra"))
     edges = ",".join(f"{e['source']}>{e['target']}" for e in graph["edges"])
     journeys = "; ".join(f"{j}: {','.join(v['services'])}" for j, v in (graph.get("journeys") or {}).items())
@@ -233,12 +252,16 @@ def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict]) 
         for e in hist[:5]
     ) or "none"
     cand = "\n".join(
-        f"- {s.candidate.id} (target {s.candidate.target}, {s.candidate.label}) det_score {s.det_score} {json.dumps(s.components)}" for s in top
+        f"- {s.candidate.id} (target {s.candidate.target}, {s.candidate.label}{f', tier {s.candidate.tier}' if strategy else ''}) "
+        f"det_score {s.det_score} {json.dumps(s.components)}" for s in top
     )
-    return (
+    out = (
         f"Services (* stateful): {nodes}\nCalls (caller>callee): {edges}\nJourneys: {journeys}\n"
-        f"Baseline: {base}\nLast experiments: {h}\nCandidates:\n{cand}"
+        f"Baseline: {base}\nLast experiments: {h}\n"
     )
+    if strategy:
+        out += f"Strategy: {strategy}\n"
+    return out + f"Candidates:\n{cand}"
 
 
 SYSTEM = (
@@ -249,19 +272,25 @@ SYSTEM = (
     '"hypothesis":"what you expect to happen for the rank 1 pick","predicted_blast_radius":["service or journey names affected by the rank 1 pick"]}. '
     "Include every candidate exactly once."
 )
+RUN_NOTE = (
+    " The user message gives the run strategy (survivable first, climb as results come in). "
+    "Let your reasons reflect it: say why the pick fits the current tier and what the earlier results suggest."
+)
 
 
-def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None) -> PlanResult:
+def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier: int | None = None,
+         exclude=(), strategy: str | None = None) -> PlanResult:
     top_k = top_k or cfg.planner.top_k
     hist = history(store, cfg.planner.history)
-    scored = score_candidates(cfg, graph, hist, generate_candidates(cfg, graph))
+    cands = [c for c in generate_candidates(cfg, graph) if (max_tier is None or c.tier <= max_tier) and c.target not in exclude]
+    scored = score_candidates(cfg, graph, hist, cands)
     top = select_top(cfg, scored, top_k)
     model = cfg.llm.planner_model
     if not top:
         return PlanResult(ranked=[], hypothesis="", blast_radius=[], fallback=True, fallback_reason="no candidates", model=model)
-    ctx = build_context(cfg, graph, store, top, hist)
+    ctx = build_context(cfg, graph, store, top, hist, strategy)
     out, meta = llm.call_structured(
-        "planner", model, PlannerOut, SYSTEM, ctx, cfg.llm.timeout_s, store=store,
+        "planner", model, PlannerOut, SYSTEM + (RUN_NOTE if strategy else ""), ctx, cfg.llm.timeout_s, store=store,
         input_summary=f"{len(top)} candidates, {len(graph['nodes'])} nodes, {len(hist)} past experiments", chat=chat,
     )
     by_id = {s.candidate.id: s for s in top}

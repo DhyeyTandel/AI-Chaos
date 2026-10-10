@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import baseline as bl
-from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer
+from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer, runs as runs_mod
 from .agents import planner as planner_mod
 from . import reaper as reaper_mod
 from .config import load_config
@@ -22,6 +22,8 @@ from .store import Store, default_db_path
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 agents_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Agent tools.")
 app.add_typer(agents_app, name="agents")
+runs_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Stored autonomous runs.")
+app.add_typer(runs_app, name="runs")
 console = Console(width=int(os.environ["COLUMNS"]) if os.environ.get("COLUMNS", "").isdigit() else None)
 
 DEMO_SAFE = ("quote", "delay", 150)
@@ -385,6 +387,105 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
     else:
         console.print(f"planner: groq {res.model} ({res.latency_ms:.0f} ms{', cached' if res.cached else ''})", markup=False)
     raise typer.Exit(0 if pick else 1)
+
+
+def _round_source(r: dict) -> str:
+    return "FALLBACK" if r["fallback"] else f"LLM #{r['llm_rank'] or '-'}"
+
+
+def _print_round(r: dict, total: int):
+    src = f"FALLBACK ({r.get('fallback_reason')})" if r["fallback"] else "LLM"
+    console.print(
+        f"round {r['round']}/{total}  tier {r['tier']}  pick {r['candidate_id']} (tier {r.get('target_tier', '-')})", markup=False
+    )
+    console.print(f"  {src}: {r['reason']}", markup=False, highlight=False)
+    console.print(
+        f"  outcome {r['outcome']}  recovery {'never' if r['recovery_s'] is None else _fmt(r['recovery_s'], '{:.1f}') + 's'}"
+        + (f"  abort: {r['abort_reason']}" if r["abort_reason"] else ""),
+        markup=False, highlight=False,
+    )
+    console.print(f"  climb: {r['climb_decision']}", markup=False, highlight=False)
+
+
+def _print_run(run: dict, rows: list[dict]):
+    t = Table("round", "tier", "pick", "source", "outcome", "recovery s", "climb decision")
+    t.columns[6].overflow = "fold"
+    for r in rows:
+        t.add_row(
+            str(r["round"]), str(r["tier"]), r["candidate_id"], _round_source(r), r["outcome"] or "-",
+            "never" if r["recovery_s"] is None else _fmt(r["recovery_s"], "{:.1f}"), r["climb_decision"] or "-",
+            style="red" if r["outcome"] == "ABORTED" else None,
+        )
+    console.print(t)
+    console.print(
+        f"run {run['run_id']}: rounds {run['rounds_done']}/{run['rounds_planned']}, final tier {run['final_tier'] or '-'}, "
+        f"stop: {run['stop_reason'] or 'running'}",
+        markup=False,
+    )
+
+
+@app.command("run")
+def run_cmd(rounds: int = typer.Option(3, "--rounds", "-r", min=1, max=8, help="Experiments to run, climbing the risk ladder")):
+    """Autonomous run: plan, validate, execute, record, repeat; start at tier 1 and climb as experiments survive."""
+    cfg = load_config()
+    store = Store()
+    overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
+    gmap = planner_mod.load_map(cfg, overrides, _data_dir() / "map.json")
+    if bl.latest(store) is None:
+        console.print("no baseline; run `faultline baseline` first")
+        raise typer.Exit(2)
+    driver = faults.DockerDriver()
+    exp_mod.stop_path().unlink(missing_ok=True)
+    with runs_mod.RunControl() as control:
+        control.install_signals()
+
+        def runner(c):
+            try:
+                return asyncio.run(exp_mod.run_experiment(
+                    store, driver, cfg, c.fault, c.target, c.duration_s, dict(c.params),
+                    log=lambda m: console.print(m, markup=False, highlight=False),
+                ))
+            except KeyboardInterrupt:
+                console.print("interrupted; reverting", markup=False)
+                Injector(Ledger(store), driver, cfg).revert_all()
+                control.request("operator interrupt (Ctrl+C)")
+                return None
+            finally:
+                control.install_signals()
+
+        try:
+            run = plan_graph.run_loop(
+                cfg, gmap, store, rounds, runner, lambda: runs_mod.wait_for_baseline(store, cfg, control), control,
+                log=lambda m: console.print(m, markup=False, highlight=False), on_round=lambda r: _print_round(r, rounds),
+            )
+        except KeyboardInterrupt:
+            Injector(Ledger(store), driver, cfg).revert_all()
+            run = runs_mod.get(store)
+    console.print()
+    _print_run(run, runs_mod.rounds(store, run["run_id"]))
+    open_left = Ledger(store).open_entries()
+    if open_left:
+        console.print(f"LEDGER HAS OPEN ENTRIES: {[e['id'] for e in open_left]}", markup=False)
+    raise typer.Exit(0 if run["rounds_done"] == run["rounds_planned"] and not open_left else 1)
+
+
+@runs_app.command("show")
+def runs_show(run_id: str = typer.Argument(None, help="Run id (default: latest)")):
+    """Print a stored run (latest by default)."""
+    store = Store()
+    run = runs_mod.get(store, run_id)
+    if not run:
+        console.print("no such run" if run_id else "no runs stored")
+        raise typer.Exit(1)
+    rows = runs_mod.rounds(store, run["run_id"])
+    _print_run(run, rows)
+    for r in rows:
+        console.print(f"round {r['round']} {r['candidate_id']}: {r['hypothesis']}", markup=False, highlight=False)
+        console.print(
+            f"  predicted blast radius: {', '.join(r['predicted_blast_radius']) or 'none'}; experiment {r['experiment_id']}"
+            + (f"; abort: {r['abort_reason']}" if r["abort_reason"] else ""),
+            markup=False, highlight=False,
+        )
 
 
 @agents_app.command("trace")

@@ -84,6 +84,37 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     PRIMARY KEY (day, model)
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    rounds_planned INTEGER NOT NULL,
+    rounds_done INTEGER NOT NULL DEFAULT 0,
+    final_tier INTEGER,
+    stop_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS run_rounds (
+    run_id TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    tier INTEGER NOT NULL,
+    candidate_id TEXT,
+    fault TEXT,
+    target TEXT,
+    params TEXT,
+    llm_rank INTEGER,
+    reason TEXT,
+    fallback INTEGER NOT NULL DEFAULT 0,
+    hypothesis TEXT,
+    predicted_blast_radius TEXT,
+    experiment_id TEXT,
+    outcome TEXT,
+    abort_reason TEXT,
+    recovery_s REAL,
+    climb_decision TEXT,
+    PRIMARY KEY (run_id, round)
+);
+
 CREATE TABLE IF NOT EXISTS llm_cache (
     key TEXT PRIMARY KEY,
     model TEXT NOT NULL,

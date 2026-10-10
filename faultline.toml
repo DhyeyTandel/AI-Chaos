@@ -100,3 +100,18 @@ crash = 1.0
 delay300 = 0.6
 loss = 0.5
 delay100 = 0.3
+
+[planner.tiers]
+# risk ladder, applied to every candidate as `tier` (derived from the map's journeys and stateful flags)
+#   tier 1: delay <= light_delay_ms on any allowed target; crash of a service no journey depends on
+#   tier 2: delay above light_delay_ms (300 ms); packet loss; crash of a service on some but not all journeys
+#   tier 3: crash of a service on every journey, or of a stateful service (data store, broker)
+light_delay_ms = 100      # delays up to this are tier 1, above it tier 2
+critical = []             # extra targets whose crash is always tier 3
+# [planner.tiers.overrides]   # pin one candidate to a tier, e.g. "crash:ad:20s" = 2
+
+[run]
+# `faultline run`: start at tier 1, climb one tier after climb_after survived experiments at the current tier
+climb_after = 2           # COMPLETED experiments (no abort) needed at a tier before climbing; max tier is 3
+cooldown_s = 10           # pause between rounds
+settle_wait_s = 60        # then wait up to this long for a probe window within baseline thresholds, else stop the run

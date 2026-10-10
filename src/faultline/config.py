@@ -58,7 +58,9 @@ DEFAULTS = {
         "history": 10,
         "weights": {"fan_in": 1.0, "journeys": 2.0, "stateful": 1.0, "untested": 1.5, "recent": 1.5, "severity": 0.5},
         "severity": {"crash": 1.0, "delay300": 0.6, "loss": 0.5, "delay100": 0.3},
+        "tiers": {"light_delay_ms": 100, "critical": [], "overrides": {}},
     },
+    "run": {"climb_after": 2, "cooldown_s": 10, "settle_wait_s": 60},
 }
 
 
