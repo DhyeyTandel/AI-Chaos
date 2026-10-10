@@ -181,4 +181,4 @@ vendor/opentelemetry-demo/   upstream demo 3.1.0 (git submodule)
 
 The application under test is the [OpenTelemetry Demo](https://github.com/open-telemetry/opentelemetry-demo), Apache 2.0. The approach follows the principles of chaos engineering: define steady state, form a hypothesis, inject realistic faults, and limit the blast radius.
 
-License: to be added by the author.
+License: MIT (see [LICENSE](LICENSE)). The OpenTelemetry Demo in `vendor/opentelemetry-demo` keeps its own Apache 2.0 license.
