@@ -3,8 +3,8 @@ from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from . import faults, runs
-from .agents import planner, validator
+from . import analyzer, faults, report, runs
+from .agents import analyst, fixer, planner, validator
 
 
 class PlanState(TypedDict, total=False):
@@ -213,3 +213,47 @@ def run_loop(cfg, graph_map: dict, store, rounds: int, runner, settler, control,
         raise
     runs.update(store, run_id, ended_at=time.time(), stop_reason=state.get("stop_reason") or "ended")
     return runs.get(store, run_id)
+
+
+class ReportState(TypedDict, total=False):
+    run: dict
+    rounds: list[dict]
+    since: float
+    analysis: dict
+    analyst: analyst.AnalystResult
+    fixer: fixer.FixerResult
+    data: dict
+    paths: dict
+
+
+def build_report_graph(cfg, graph_map: dict, store, out_root, chat=None):
+    def analyze_node(state: ReportState) -> ReportState:
+        run, rounds = state["run"], state["rounds"]
+        analysis = analyzer.analyze(cfg, store, graph_map, run, rounds)
+        known = {n for n, a in graph_map["nodes"].items() if a.get("kind") in ("app", "infra")}
+        return {"analysis": analysis, "analyst": analyst.analyze(cfg, store, analysis, known, chat=chat)}
+
+    def fix_node(state: ReportState) -> ReportState:
+        return {"fixer": fixer.fix(cfg, store, state["analysis"], graph_map, state["analyst"].weaknesses, chat=chat)}
+
+    def report_node(state: ReportState) -> ReportState:
+        data = report.build(cfg, store, state["run"], state["rounds"], state["analysis"], state["analyst"], state["fixer"], state["since"])
+        return {"data": data, "paths": report.write(cfg, data, out_root)}
+
+    g = StateGraph(ReportState)
+    g.add_node("analyze", analyze_node)
+    g.add_node("fix", fix_node)
+    g.add_node("report", report_node)
+    g.set_entry_point("analyze")
+    g.add_edge("analyze", "fix")
+    g.add_edge("fix", "report")
+    g.add_edge("report", END)
+    return g.compile()
+
+
+def run_report(cfg, graph_map: dict, store, out_root, run_id: str | None = None, chat=None) -> ReportState | None:
+    run = runs.get(store, run_id)
+    if run is None:
+        return None
+    init = {"run": run, "rounds": runs.rounds(store, run["run_id"]), "since": time.time() - 1}
+    return build_report_graph(cfg, graph_map, store, out_root, chat).invoke(init)

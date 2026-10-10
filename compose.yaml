@@ -25,6 +25,7 @@ services:
       - faultline-data:/data
       - ./faultline.toml:/app/faultline.toml:ro
       - ./map.overrides.yaml:/app/map.overrides.yaml:ro
+      - ./reports:/app/reports
 
   reaper:
     container_name: reaper

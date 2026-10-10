@@ -425,7 +425,10 @@ def _print_run(run: dict, rows: list[dict]):
 
 
 @app.command("run")
-def run_cmd(rounds: int = typer.Option(3, "--rounds", "-r", min=1, max=8, help="Experiments to run, climbing the risk ladder")):
+def run_cmd(
+    rounds: int = typer.Option(3, "--rounds", "-r", min=1, max=8, help="Experiments to run, climbing the risk ladder"),
+    make_report: bool = typer.Option(False, "--report", help="Generate the findings report after the run"),
+):
     """Autonomous run: plan, validate, execute, record, repeat; start at tier 1 and climb as experiments survive."""
     cfg = load_config()
     store = Store()
@@ -466,7 +469,39 @@ def run_cmd(rounds: int = typer.Option(3, "--rounds", "-r", min=1, max=8, help="
     open_left = Ledger(store).open_entries()
     if open_left:
         console.print(f"LEDGER HAS OPEN ENTRIES: {[e['id'] for e in open_left]}", markup=False)
+    if make_report:
+        _make_report(cfg, store, gmap, run["run_id"])
     raise typer.Exit(0 if run["rounds_done"] == run["rounds_planned"] and not open_left else 1)
+
+
+def _reports_dir() -> Path:
+    return Path(os.environ.get("FAULTLINE_REPORTS", "/app/reports"))
+
+
+def _make_report(cfg, store, gmap, run_id) -> dict | None:
+    state = plan_graph.run_report(cfg, gmap, store, _reports_dir(), run_id)
+    if state is None:
+        console.print("no such run" if run_id else "no runs stored")
+        return None
+    d = state["data"]
+    console.print(f"report for {d['run']['run_id']}: overall resilience score {_fmt(d['overall_score'], '{:.1f}')} ({d['rating']})", markup=False)
+    for k, p in state["paths"].items():
+        console.print(f"  {k}: {p}", markup=False)
+    for w in d["weaknesses"][:3]:
+        console.print(f"  weakness {w['rank']} [{w['severity']}] {w['title']}", markup=False, highlight=False)
+    for u in d["ai_usage"]:
+        console.print(f"  agent {u['agent']}: {u['path']} ({u['prompt_tokens']}/{u['completion_tokens']} tokens)", markup=False, highlight=False)
+    return state
+
+
+@app.command()
+def report(run_id: str = typer.Option(None, "--run", help="Run id (default: latest)")):
+    """Analyze a stored run and write report.md, report.html and report.json under reports/<run_id>/."""
+    cfg = load_config()
+    store = Store()
+    overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
+    gmap = planner_mod.load_map(cfg, overrides, _data_dir() / "map.json")
+    raise typer.Exit(0 if _make_report(cfg, store, gmap, run_id) else 1)
 
 
 @runs_app.command("show")

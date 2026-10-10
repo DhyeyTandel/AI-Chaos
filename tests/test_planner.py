@@ -62,7 +62,7 @@ def top_ids(cfg, store):
 def test_candidates_respect_allowlist_and_tooling(cfg):
     ids = [c.id for c in planner.generate_candidates(cfg, gmap())]
     assert not any("grafana" in i for i in ids)
-    assert "crash:cart:20s" in ids and "delay:quote:100ms" in ids and "loss:quote:10pct" in ids
+    assert "crash:cart:20s" in ids and "delay:quote:50ms" in ids and "loss:quote:10pct" in ids
 
 
 def test_scoring_is_deterministic_and_ordered(cfg, store):

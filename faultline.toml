@@ -71,8 +71,8 @@ safety = "low"
 
 [llm.max_tokens]          # output cap per call, includes hidden reasoning tokens
 planner = 1500
-analyst = 1500
-fixer = 2000
+analyst = 3000
+fixer = 3000
 safety = 800
 
 [planner]
@@ -118,3 +118,17 @@ critical = ["flagd"]      # extra targets whose crash is always tier 3 (flagd: h
 climb_after = 2           # COMPLETED experiments (no abort) needed at a tier before climbing; max tier is 3
 cooldown_s = 10           # pause between rounds
 settle_wait_s = 60        # then wait up to this long for a probe window within baseline thresholds, else stop the run
+
+[score]
+# penalty = 100 * (impact_weight * impact + breadth_weight * breadth + recovery_weight * recovery)
+impact_weight = 0.5
+breadth_weight = 0.3
+recovery_weight = 0.2
+recovery_cap_s = 60       # recovery component = min(1, recovery_s / recovery_cap_s); never recovered = 1
+err_full = 0.5            # an error-rate rise of this much (50 points) over baseline is full degradation (1.0)
+p95_full_ratio = 10.0     # a p95 of this many times baseline is full degradation (1.0), log scale
+p95_base_floor_ms = 100   # baseline p95 below this is treated as this value, so tiny baselines do not inflate the ratio
+affected_margin = 0.2     # journey counts as affected at this degradation (about 1.6x p95 or +10 error points), or on a threshold breach
+hidden_min_impact = 0.3   # an unpredicted journey must degrade at least this much to count as a hidden dependency
+weak_min_penalty = 10     # fallback ranking lists experiments at or above this penalty
+max_weaknesses = 5

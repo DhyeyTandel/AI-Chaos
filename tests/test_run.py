@@ -43,7 +43,7 @@ def go(cfg, store, rounds, runner, settler=lambda: ("ok", ""), control=None, cha
 
 def test_tier_assignment(cfg):
     tiers = {c.id: c.tier for c in planner.generate_candidates(cfg, gmap())}
-    assert tiers["delay:cart:100ms"] == 1 and tiers["delay:cart:300ms"] == 2 and tiers["loss:cart:10pct"] == 2
+    assert tiers["delay:cart:50ms"] == 1 and tiers["delay:cart:300ms"] == 2 and tiers["loss:cart:10pct"] == 2
     assert tiers["crash:quote:20s"] == 1 and tiers["crash:checkout:20s"] == 1
     assert tiers["crash:cart:20s"] == 2
     assert tiers["crash:frontend:20s"] == 3 and tiers["crash:valkey-cart:20s"] == 3
@@ -52,9 +52,9 @@ def test_tier_assignment(cfg):
 def test_tier_overrides_and_critical(cfg):
     cfg.planner.tiers.critical = ["quote"]
     setattr(cfg.planner.tiers.overrides, "crash:cart:20s", 3)
-    setattr(cfg.planner.tiers.overrides, "delay:cart:100ms", 2)
+    setattr(cfg.planner.tiers.overrides, "delay:cart:50ms", 2)
     tiers = {c.id: c.tier for c in planner.generate_candidates(cfg, gmap())}
-    assert tiers["crash:quote:20s"] == 3 and tiers["crash:cart:20s"] == 3 and tiers["delay:cart:100ms"] == 2
+    assert tiers["crash:quote:20s"] == 3 and tiers["crash:cart:20s"] == 3 and tiers["delay:cart:50ms"] == 2
 
 
 def test_climbs_after_two_survived(rcfg, store):

@@ -1,0 +1,1331 @@
+{
+  "run": {
+    "run_id": "run-142958-f149",
+    "started_at": 1791642598.118421,
+    "ended_at": 1791642720.354172,
+    "rounds_planned": 3,
+    "rounds_done": 3,
+    "final_tier": 2,
+    "stop_reason": "completed 3 rounds"
+  },
+  "generated_at": 1791642750.3770072,
+  "overall_score": 37.9,
+  "rating": "poor",
+  "executive_summary": "The shop\u2019s overall resilience score of 37.9 masks several critical weaknesses. The cart service is a clear single point of failure; its crash or cache loss spikes latency to >3 s and aborts experiments. Small latency injections in frontend and astronomy-db cause system-wide watchdog breaches, indicating a wide blast radius. Hidden dependencies surface when astronomy-db delays affect checkout and flagd crashes affect cart, revealing gaps in the dependency map. Finally, even modest delays in the frontend-proxy propagate to most user journeys. Addressing these issues - by adding redundancy to cart,",
+  "weaknesses": [
+    {
+      "rank": 1,
+      "title": "Cart service single point of failure",
+      "severity": "critical",
+      "services": [
+        "cart"
+      ],
+      "explanation": "The cart service is a single point of failure. A crash of cart (exp-142250-d200) pushes cart p95 latency to 3007 ms, aborts the experiment and degrades the cart journey completely (impact 1.00). Crashing its cache (valkey-cart, exp-104221-fd4f) produces the same latency spike, confirming that loss of cart stops core checkout flow.",
+      "evidence": "exp-142250-d200 crash on cart: p95 3007 ms, impact 1.00, breadth 0.25, penalty 60; exp-104221-fd4f crash on valkey-cart: p95 3007 ms, impact 1.00, breadth 0.25, penalty 60",
+      "related_experiment_ids": [
+        "exp-142250-d200",
+        "exp-104221-fd4f"
+      ],
+      "source": "llm",
+      "fix": {
+        "weakness_rank": 1,
+        "fix_title": "Add Cart Replicas and Restart Policy",
+        "fix_type": "architecture",
+        "steps": "Deploy a second instance of the cart service and its Valkey cache. Update the Docker Compose file to run two replicas (docker compose up --scale cart=2 --scale valkey-cart=2). Configure the client library to use a load-balancing round-robin DNS name. Add a circuit-breaker around cart calls that falls back to a stale cache entry if both instances are unavailable.",
+        "compose_override": null,
+        "expected_effect": "If one cart or cache instance crashes, the other continues serving, keeping p95 latency low and preventing full checkout failure.",
+        "source": "llm",
+        "override_dropped": "not valid YAML"
+      }
+    },
+    {
+      "rank": 2,
+      "title": "Wide blast radius from frontend and astronomy-db latency",
+      "severity": "high",
+      "services": [
+        "frontend",
+        "astronomy-db"
+      ],
+      "explanation": "Small latency injections (100-300 ms) on frontend and astronomy-db trigger watchdog breaches across all user journeys (cart, checkout, home, product). Both experiments report impact 1.00 and breadth 1.00, showing these services sit on a critical path whose slowdown propagates system-wide.",
+      "evidence": "exp-143142-3011 astronomy-db 300 ms delay: impact 1.00, breadth 1.00, penalty 82; exp-141542-f9bb frontend 100 ms delay: impact 1.00, breadth 1.00, penalty 82",
+      "related_experiment_ids": [
+        "exp-143142-3011",
+        "exp-141542-f9bb"
+      ],
+      "source": "llm",
+      "fix": {
+        "weakness_rank": 2,
+        "fix_title": "Timeouts, Retries and Circuit Breakers for Frontend & DB",
+        "fix_type": "code",
+        "steps": "In the frontend and any service calling astronomy-db, set a request timeout of 200 ms. Wrap the call in a retry policy with exponential back-off (max 2 retries). Add a circuit-breaker that opens after 3 consecutive timeouts and returns cached DB data or a graceful degradation response. Deploy a read-through cache for frequent DB queries.",
+        "compose_override": null,
+        "expected_effect": "Transient 100-300 ms delays no longer cascade; calls either succeed quickly, use cached data, or fail fast, keeping overall journey impact low.",
+        "source": "llm",
+        "override_dropped": null
+      }
+    },
+    {
+      "rank": 3,
+      "title": "Hidden dependencies causing unexpected degradation",
+      "severity": "high",
+      "services": [
+        "checkout",
+        "flagd",
+        "cart"
+      ],
+      "explanation": "Experiments reveal services that are not in the predicted journey map but still degrade. A 100 ms delay on astronomy-db (exp-141736-9801) unexpectedly degrades checkout, and a crash of flagd (exp-141616-6842) degrades cart, indicating hidden coupling between these services.",
+      "evidence": "exp-141736-9801 astronomy-db delay: degraded checkout (impact 0.83); exp-141616-6842 flagd crash: degraded cart (impact 1.00)",
+      "related_experiment_ids": [
+        "exp-141736-9801",
+        "exp-141616-6842"
+      ],
+      "source": "llm",
+      "fix": {
+        "weakness_rank": 3,
+        "fix_title": "Introduce Service-Mesh Resilience for Hidden Couplings",
+        "fix_type": "architecture",
+        "steps": "Deploy a lightweight service mesh (e.g., Linkerd). Define per-service policies: 100 ms timeout, 2-retry back-off, and circuit-breaker for calls to flagd and astronomy-db. Enable automatic retries for idempotent GETs. Add observability rules to surface unexpected call graphs.",
+        "compose_override": null,
+        "expected_effect": "Crashes or delays in flagd or astronomy-db trigger circuit-breakers and retries instead of silently degrading unrelated services, exposing hidden dependencies.",
+        "source": "llm",
+        "override_dropped": null
+      }
+    },
+    {
+      "rank": 4,
+      "title": "Frontend-proxy latency spreads partial impact",
+      "severity": "medium",
+      "services": [
+        "frontend-proxy"
+      ],
+      "explanation": "A 50 ms delay on frontend-proxy (exp-142159-53ea) degrades three of four major journeys (cart, checkout, home) with impact 0.56 and breadth 0.75, showing that even modest slowdown in the proxy layer can affect a large portion of traffic.",
+      "evidence": "exp-142159-53ea frontend-proxy 50 ms delay: impact 0.56, breadth 0.75, penalty 52, degraded cart,checkout,home",
+      "related_experiment_ids": [
+        "exp-142159-53ea"
+      ],
+      "source": "llm",
+      "fix": {
+        "weakness_rank": 4,
+        "fix_title": "Scale Frontend-Proxy and Enable Restart",
+        "fix_type": "config",
+        "steps": "Add a second replica of frontend-proxy in docker-compose (docker compose up --scale frontend-proxy=2). Set restart: unless-stopped for the service. Configure the proxy to use keep-alive connections and enable in-memory response caching for static assets.",
+        "compose_override": null,
+        "expected_effect": "A 50 ms delay in one proxy instance is absorbed by the other replica; restart policy ensures quick recovery, reducing impact on cart, checkout and home journeys.",
+        "source": "llm",
+        "override_dropped": "top level must be services"
+      }
+    }
+  ],
+  "experiments": [
+    {
+      "experiment_id": "exp-142959-df17",
+      "round": 1,
+      "scope": "run",
+      "tier": 1,
+      "candidate_id": "delay:valkey-cart:50ms",
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 50ms",
+      "target": "valkey-cart",
+      "reason": "Highest detection score; stateful cache, untested path, moderate fan-in reveals hidden dependency on cart/checkout journeys.",
+      "planner_fallback": false,
+      "hypothesis": "Delaying valkey-cart by 50 ms will increase latency of the cart and checkout journeys, exposing the hidden dependency on the stateful cache and potentially causing error rate rise in those journeys.",
+      "predicted_blast_radius": [
+        "cart",
+        "checkout"
+      ],
+      "predicted_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.632,
+        "checkout": 0.632
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "impact": 0.632,
+      "breadth": 0.5,
+      "recovery_s": 5.008724212646484,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 48.3,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-143050-96fc",
+      "round": 2,
+      "scope": "run",
+      "tier": 1,
+      "candidate_id": "delay:currency:50ms",
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 50ms",
+      "target": "currency",
+      "reason": "Targets a non-stateful, low-fan-in service used in all journeys; recent success shows survivability, exposing hidden cross-journey latency impact.",
+      "planner_fallback": false,
+      "hypothesis": "Delaying currency by 50 ms will increase latency across all journeys, revealing hidden latency propagation and potential SLA breaches without causing failures.",
+      "predicted_blast_radius": [
+        "home",
+        "product",
+        "cart",
+        "checkout"
+      ],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.243
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.243,
+      "breadth": 0.25,
+      "recovery_s": 5.009921550750732,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 21.3,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-143142-3011",
+      "round": 3,
+      "scope": "run",
+      "tier": 2,
+      "candidate_id": "delay:astronomy-db:300ms",
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 300ms",
+      "target": "astronomy-db",
+      "reason": "Tier-2 light delay on a stateful, fan-in service used by all journeys; reveals hidden dependencies and single-point-of-failure risk after earlier 50ms delays survived.",
+      "planner_fallback": false,
+      "hypothesis": "Injecting a 300 ms delay into astronomy-db will increase latency across home, product, cart, and checkout journeys, exposing its role as a critical stateful bottleneck and likely causing p95 degradation and higher error rates.",
+      "predicted_blast_radius": [
+        "home",
+        "product",
+        "cart",
+        "checkout"
+      ],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "home",
+        "product"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: cart p95 1876ms > 800ms; checkout p95 1244ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.53,
+        "product": 0.799,
+        "cart": 1.0,
+        "checkout": 1.0
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "impact": 1.0,
+      "breadth": 1.0,
+      "recovery_s": 5.007501125335693,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 81.7,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-100645-5f9e",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "recommendation",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [],
+      "mapped_journeys": [],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.0
+      },
+      "affected_journeys": [],
+      "impact": 0.0,
+      "breadth": 0.0,
+      "recovery_s": 5.006091594696045,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 1.7,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-100938-5e55",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.613
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.613,
+      "breadth": 0.25,
+      "recovery_s": 5.006852149963379,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 39.8,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-101307-fafe",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.518
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.518,
+      "breadth": 0.25,
+      "recovery_s": 5.006711959838867,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 35.1,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-101816-a2ca",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.599
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.599,
+      "breadth": 0.25,
+      "recovery_s": 5.007378578186035,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 39.1,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-102326-39d7",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.515
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.515,
+      "breadth": 0.25,
+      "recovery_s": 5.009483098983765,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 34.9,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-102927-a733",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.527
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.527,
+      "breadth": 0.25,
+      "recovery_s": 5.008092164993286,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 35.5,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-103908-31bc",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.541
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.541,
+      "breadth": 0.25,
+      "recovery_s": 5.0090248584747314,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 36.2,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-104221-fd4f",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "crash",
+      "kind": "crash",
+      "label": "crash",
+      "target": "valkey-cart",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: cart p95 3007ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 1.0,
+        "checkout": 0.0
+      },
+      "affected_journeys": [
+        "cart"
+      ],
+      "impact": 1.0,
+      "breadth": 0.25,
+      "recovery_s": 6.0114076137542725,
+      "recovery_norm": 0.1,
+      "never_recovered": false,
+      "penalty": 59.5,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-104625-3f16",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.521
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.521,
+      "breadth": 0.25,
+      "recovery_s": 5.008585453033447,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 35.2,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-105036-fe30",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.517
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.517,
+      "breadth": 0.25,
+      "recovery_s": 5.015501976013184,
+      "recovery_norm": 0.084,
+      "never_recovered": false,
+      "penalty": 35.0,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-105242-e257",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "loss",
+      "label": "loss 10%",
+      "target": "currency",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.513
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.513,
+      "breadth": 0.25,
+      "recovery_s": 5.009527206420898,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 34.8,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-140231-db3a",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 100ms",
+      "target": "quote",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "checkout"
+      ],
+      "mapped_journeys": [
+        "checkout"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 0.0,
+        "checkout": 0.612
+      },
+      "affected_journeys": [
+        "checkout"
+      ],
+      "impact": 0.612,
+      "breadth": 0.25,
+      "recovery_s": 5.00832462310791,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 39.8,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-141542-f9bb",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 100ms",
+      "target": "frontend",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: cart p95 865ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.545,
+        "product": 0.373,
+        "cart": 1.0,
+        "checkout": 0.8
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "impact": 1.0,
+      "breadth": 1.0,
+      "recovery_s": 5.009009838104248,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 81.7,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-141616-6842",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "crash",
+      "kind": "crash",
+      "label": "crash",
+      "target": "flagd",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [],
+      "mapped_journeys": [],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: cart p95 3051ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 1.0,
+        "checkout": 0.0
+      },
+      "affected_journeys": [
+        "cart"
+      ],
+      "impact": 1.0,
+      "breadth": 0.25,
+      "recovery_s": 6.0104639530181885,
+      "recovery_norm": 0.1,
+      "never_recovered": false,
+      "penalty": 59.5,
+      "verdict": "REFUTED",
+      "hidden_journeys": [
+        "cart"
+      ]
+    },
+    {
+      "experiment_id": "exp-141653-b9e0",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 100ms",
+      "target": "product-catalog",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: checkout p95 864ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.397,
+        "product": 0.64,
+        "cart": 0.741,
+        "checkout": 0.939
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "impact": 0.939,
+      "breadth": 1.0,
+      "recovery_s": 5.00825047492981,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 78.6,
+      "verdict": "CONFIRMED",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-141736-9801",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 100ms",
+      "target": "astronomy-db",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "home",
+        "product"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "kill switch (STOP file)",
+      "injected": true,
+      "degradation": {
+        "home": 0.718,
+        "product": 0.792,
+        "cart": 0.833,
+        "checkout": 0.668
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "impact": 0.833,
+      "breadth": 1.0,
+      "recovery_s": 5.010474681854248,
+      "recovery_norm": 0.084,
+      "never_recovered": false,
+      "penalty": 73.3,
+      "verdict": "PARTIAL",
+      "hidden_journeys": [
+        "checkout"
+      ]
+    },
+    {
+      "experiment_id": "exp-142108-4440",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 50ms",
+      "target": "astronomy-db",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.135,
+        "cart": 0.585,
+        "checkout": 0.442
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "impact": 0.585,
+      "breadth": 0.5,
+      "recovery_s": 5.011282205581665,
+      "recovery_norm": 0.084,
+      "never_recovered": false,
+      "penalty": 45.9,
+      "verdict": "PARTIAL",
+      "hidden_journeys": [
+        "checkout"
+      ]
+    },
+    {
+      "experiment_id": "exp-142159-53ea",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "delay",
+      "kind": "delay",
+      "label": "delay 50ms",
+      "target": "frontend-proxy",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout",
+        "home",
+        "product"
+      ],
+      "outcome": "COMPLETED",
+      "abort_reason": null,
+      "injected": true,
+      "degradation": {
+        "home": 0.4,
+        "product": 0.14,
+        "cart": 0.562,
+        "checkout": 0.429
+      },
+      "affected_journeys": [
+        "cart",
+        "checkout",
+        "home"
+      ],
+      "impact": 0.562,
+      "breadth": 0.75,
+      "recovery_s": 5.008219003677368,
+      "recovery_norm": 0.083,
+      "never_recovered": false,
+      "penalty": 52.3,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    },
+    {
+      "experiment_id": "exp-142250-d200",
+      "round": null,
+      "scope": "history",
+      "tier": null,
+      "candidate_id": null,
+      "fault": "crash",
+      "kind": "crash",
+      "label": "crash",
+      "target": "cart",
+      "reason": null,
+      "planner_fallback": false,
+      "hypothesis": null,
+      "predicted_blast_radius": [],
+      "predicted_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "mapped_journeys": [
+        "cart",
+        "checkout"
+      ],
+      "outcome": "ABORTED",
+      "abort_reason": "watchdog breach: cart p95 3007ms > 800ms",
+      "injected": true,
+      "degradation": {
+        "home": 0.0,
+        "product": 0.0,
+        "cart": 1.0,
+        "checkout": 0.0
+      },
+      "affected_journeys": [
+        "cart"
+      ],
+      "impact": 1.0,
+      "breadth": 0.25,
+      "recovery_s": 6.008989334106445,
+      "recovery_norm": 0.1,
+      "never_recovered": false,
+      "penalty": 59.5,
+      "verdict": "PARTIAL",
+      "hidden_journeys": []
+    }
+  ],
+  "hidden_dependencies": [
+    {
+      "experiment_id": "exp-141616-6842",
+      "scope": "history",
+      "target": "flagd",
+      "fault": "crash",
+      "unexpected_journeys": [
+        "cart"
+      ],
+      "worst_degradation": 1.0,
+      "map_note": "map shows no journey depending on it"
+    },
+    {
+      "experiment_id": "exp-141736-9801",
+      "scope": "history",
+      "target": "astronomy-db",
+      "fault": "delay 100ms",
+      "unexpected_journeys": [
+        "checkout"
+      ],
+      "worst_degradation": 0.668,
+      "map_note": "map lists journeys cart, home, product"
+    },
+    {
+      "experiment_id": "exp-142108-4440",
+      "scope": "history",
+      "target": "astronomy-db",
+      "fault": "delay 50ms",
+      "unexpected_journeys": [
+        "checkout"
+      ],
+      "worst_degradation": 0.442,
+      "map_note": "map lists journeys cart, home, product"
+    }
+  ],
+  "services": {
+    "astronomy-db": {
+      "score": 18.3,
+      "worst_experiment": "exp-143142-3011",
+      "worst_label": "delay 300ms",
+      "experiments": 3,
+      "weight": 4
+    },
+    "cart": {
+      "score": 40.5,
+      "worst_experiment": "exp-142250-d200",
+      "worst_label": "crash",
+      "experiments": 1,
+      "weight": 2
+    },
+    "currency": {
+      "score": 60.2,
+      "worst_experiment": "exp-100938-5e55",
+      "worst_label": "loss 10%",
+      "experiments": 10,
+      "weight": 4
+    },
+    "flagd": {
+      "score": 40.5,
+      "worst_experiment": "exp-141616-6842",
+      "worst_label": "crash",
+      "experiments": 1,
+      "weight": 1
+    },
+    "frontend": {
+      "score": 18.3,
+      "worst_experiment": "exp-141542-f9bb",
+      "worst_label": "delay 100ms",
+      "experiments": 1,
+      "weight": 4
+    },
+    "frontend-proxy": {
+      "score": 47.7,
+      "worst_experiment": "exp-142159-53ea",
+      "worst_label": "delay 50ms",
+      "experiments": 1,
+      "weight": 4
+    },
+    "product-catalog": {
+      "score": 21.4,
+      "worst_experiment": "exp-141653-b9e0",
+      "worst_label": "delay 100ms",
+      "experiments": 1,
+      "weight": 4
+    },
+    "quote": {
+      "score": 60.2,
+      "worst_experiment": "exp-140231-db3a",
+      "worst_label": "delay 100ms",
+      "experiments": 1,
+      "weight": 1
+    },
+    "recommendation": {
+      "score": 98.3,
+      "worst_experiment": "exp-100645-5f9e",
+      "worst_label": "loss 10%",
+      "experiments": 1,
+      "weight": 1
+    },
+    "valkey-cart": {
+      "score": 40.5,
+      "worst_experiment": "exp-104221-fd4f",
+      "worst_label": "crash",
+      "experiments": 2,
+      "weight": 2
+    }
+  },
+  "untested_services": [
+    "accounting",
+    "ad",
+    "checkout",
+    "email",
+    "fraud-detection",
+    "image-provider",
+    "kafka",
+    "payment",
+    "shipping"
+  ],
+  "score_config": {
+    "impact_weight": 0.5,
+    "breadth_weight": 0.3,
+    "recovery_weight": 0.2,
+    "recovery_cap_s": 60,
+    "err_full": 0.5,
+    "p95_full_ratio": 10.0,
+    "p95_base_floor_ms": 100,
+    "affected_margin": 0.2,
+    "hidden_min_impact": 0.3,
+    "weak_min_penalty": 10,
+    "max_weaknesses": 5
+  },
+  "formula": "penalty = 100 x (0.5 x impact + 0.3 x breadth + 0.2 x recovery); service score = 100 - worst penalty on that service; overall = mean of service scores weighted by the number of journeys the service sits on (at least 1; the larger of the map's count and the journeys it was seen to degrade).",
+  "methodology": [
+    "An independent synthetic prober exercises four user journeys (home, product, cart, checkout) through the front proxy every second. It is the ground truth and does not depend on the application's own telemetry.",
+    "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober.",
+    "Each experiment injects one fault (container crash, added network delay or packet loss), measures every journey during the fault window (up to the abort for aborted runs), reverts the fault, and measures how long the journeys take to return inside the baseline band.",
+    "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
+    "A hidden dependency is a journey that degraded by at least 0.3 although neither the hypothesis nor the dependency map expected it.",
+    "The analyst agent ranks weaknesses and the fixer agent proposes fixes from the measured results only; their output is validated against known experiments, services and an allowlist of compose keys. When Groq is unavailable or its output is invalid, rule-based fallbacks produce the same sections. Fixes are proposals and are never applied."
+  ],
+  "ai_usage": [
+    {
+      "agent": "planner",
+      "path": "groq openai/gpt-oss-120b",
+      "calls": 3,
+      "groq_calls": 3,
+      "fallbacks": 0,
+      "cached": 0,
+      "prompt_tokens": 5192,
+      "completion_tokens": 1340
+    },
+    {
+      "agent": "safety",
+      "path": "not run",
+      "calls": 0,
+      "groq_calls": 0,
+      "fallbacks": 0,
+      "cached": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0
+    },
+    {
+      "agent": "analyst",
+      "path": "groq openai/gpt-oss-120b",
+      "calls": 1,
+      "groq_calls": 1,
+      "fallbacks": 0,
+      "cached": 0,
+      "prompt_tokens": 3324,
+      "completion_tokens": 4403
+    },
+    {
+      "agent": "fixer",
+      "path": "groq openai/gpt-oss-120b",
+      "calls": 1,
+      "groq_calls": 1,
+      "fallbacks": 0,
+      "cached": 0,
+      "prompt_tokens": 953,
+      "completion_tokens": 1268
+    }
+  ],
+  "notes": {
+    "analyst_dropped": 0,
+    "fixer_filled_by_fallback": 0
+  }
+}
