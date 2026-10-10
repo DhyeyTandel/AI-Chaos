@@ -30,6 +30,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 def fmt_rec(a: dict) -> str:
     if not a["injected"]:
         return "-"
+    if not a.get("recovery_measured", True):
+        return "not measured"
     return "never" if a["never_recovered"] else "-" if a["recovery_s"] is None else f"{a['recovery_s']:.1f}s"
 
 
@@ -80,7 +82,7 @@ def formula_blocks(cfg) -> list:
         ("ul", [
             f"impact: worst journey degradation in the fault window. Per journey, max(error part, latency part). Error part = (error rate - baseline error rate) / {s.err_full}, clamped to 0..1. Latency part = ln(p95 / max(baseline p95, {s.p95_base_floor_ms} ms)) / ln({s.p95_full_ratio:g}), clamped to 0..1.",
             f"breadth: affected journeys / all journeys. A journey is affected when its degradation is at least {s.affected_margin} or it breaches the baseline threshold.",
-            f"recovery: min(1, recovery seconds / {s.recovery_cap_s}); a fault that never recovered scores 1. Recovery is measured from the revert until the journeys are back inside the baseline band.",
+            f"recovery: min(1, recovery seconds / {s.recovery_cap_s}); a fault that never recovered scores 1, and an experiment stopped by the operator before recovery was measured contributes 0. Recovery is measured from the revert until the journeys are back inside the baseline band.",
             "overall weights: each service counts once per journey it sits on in the dependency map (at least 1); a service seen degrading more journeys than the map lists uses the observed count. Untested services are excluded and listed.",
             "rating: 80 and above good, 60 to 79 fair, below 60 poor.",
         ]),
@@ -126,7 +128,10 @@ def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res
         "score_config": {k: v for k, v in vars(cfg.score).items()}, "formula": analyzer.formula_text(cfg),
         "methodology": methodology_text(cfg), "ai_usage": ai_usage(store, run, since, results),
         "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, run, analysis),
-        "notes": {"analyst_dropped": analyst_res.dropped, "fixer_filled_by_fallback": fixer_res.filled},
+        "notes": {
+            "analyst_dropped": analyst_res.dropped, "fixer_filled_by_fallback": fixer_res.filled,
+            "recovery_not_measured": [a["experiment_id"] for a in analysis["experiments"] if a["injected"] and not a["recovery_measured"]],
+        },
     })
 
 
@@ -192,6 +197,8 @@ def blocks(cfg, d: dict) -> list:
     b.append(("p", review_summary(d["preflight"])))
     n = d["notes"]
     b.append(("p", f"Analyst weaknesses dropped by validation: {n['analyst_dropped']}. Fixes filled by the rule-based catalog: {n['fixer_filled_by_fallback']}."))
+    if n.get("recovery_not_measured"):
+        b.append(("p", "Recovery was not measured for " + ", ".join(n["recovery_not_measured"]) + " (stopped by the operator before recovery could be measured). Their recovery component is excluded from the penalty (counted as 0), not scored as never recovered."))
     return b
 
 

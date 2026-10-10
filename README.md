@@ -145,8 +145,8 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 - **Risk ladder.** One run climbed from tier 1 to tier 2: 50 ms delays on astronomy-db and frontend-proxy completed, then a crash of cart was aborted by the watchdog at cart p95 3007 ms (recovery 6 s).
 - **Hidden dependency.** Crashing flagd, which is on no journey in the map, pushed cart p95 to about 3 s.
 - **Latency without errors.** 10 % packet loss on currency raised checkout p95 from 74 ms to 410 ms with zero errors.
-- **Pre-flight review and memory.** In the sample run the planner already knew six learned limits (for example delay on product-catalog aborted at 100 ms), the safety review vetoed one candidate before injection and approved the other three, and a 50 ms delay on astronomy-db was then aborted by the live safety agent because checkout p95 rose to 285 ms against a 74 ms baseline.
-- **Score.** The sample report scores the shop 37.5 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on.
+- **Pre-flight review and memory.** In the sample run the planner already knew seven learned limits (for example delay on astronomy-db aborted at 50 ms), and the safety review reduced one of the two executed candidates and approved the other.
+- **Score.** The sample report scores the shop 39.6 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on. A recovery at the measurement floor (about 5 s) is never reported as a weakness, and an experiment stopped by the operator before recovery was measured contributes no recovery component instead of counting as never recovered.
 
 ## Status
 

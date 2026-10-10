@@ -168,7 +168,7 @@ class Monitor:
             "safety", cfg.llm.safety_model, SafetyOut, SYSTEM, user, timeout_s=timeout, store=store,
             input_summary=f"{self.fault} {self.target} t={elapsed:.0f}/{self.duration}s", chat=self.chat, cache=False,
         )
-        error = meta["error"]
+        error = analyzer.clean(meta["error"]) if meta["error"] else None
         if out is not None and meta["latency_ms"] > timeout * 1000:
             out, error = None, "ignored: slower than timeout_s"
             store.add_trace("safety", cfg.llm.safety_model, f"late check t={elapsed:.0f}s", None, meta["latency_ms"], True, error)
@@ -351,9 +351,9 @@ def preflight_review(cfg, store, base, fault, target, duration, params, tier=Non
         rec["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         rec["reason"] = "review unavailable, approved by fallback"
         return rec
-    rec.update(latency_ms=round(meta["latency_ms"]), tokens=meta["prompt_tokens"] + meta["completion_tokens"], cached=meta["cached"], error=meta["error"])
+    rec.update(latency_ms=round(meta["latency_ms"]), tokens=meta["prompt_tokens"] + meta["completion_tokens"], cached=meta["cached"], error=analyzer.clean(meta["error"]) if meta["error"] else None)
     if out is None:
-        rec["reason"] = f"review unavailable ({meta['error']}), approved by fallback"
+        rec["reason"] = analyzer.clean(f"review unavailable ({meta['error']}), approved by fallback")
         return rec
     rec.update(fallback=0, reason=out.reason, decision=out.decision)
     if out.decision == "reduce":
@@ -379,6 +379,10 @@ def _changes(rec: dict) -> str:
 
 
 def describe_review(rec: dict | None) -> str:
+    return analyzer.clean(_describe_review(rec))
+
+
+def _describe_review(rec: dict | None) -> str:
     if not rec:
         return "-"
     d = rec["decision"]

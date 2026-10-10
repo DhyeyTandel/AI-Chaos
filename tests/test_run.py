@@ -166,7 +166,7 @@ def test_planner_gets_only_tier_eligible_candidates(rcfg, store):
     max_tier = [1, 1, 2]
     tested = []
     for user, mt, picked in zip(firsts, max_tier, script.calls):
-        ids = re.findall(r"^- (\S+) \(target (\S+),", user, re.M)
+        ids = re.findall(r"^\d+\. (\S+) \(target (\S+),", user, re.M)
         assert ids and all(tier_of[i] <= mt for i, _ in ids)
         assert all(t not in tested for _, t in ids)
         assert "Strategy: survivable first" in user and f"Current tier {mt}" in user

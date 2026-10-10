@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field, field_validator
 from .. import analyzer
 from .. import baseline as bl
 from .. import faults, llm, memory
+from ..mapper import INFRA, TOOLING
+
+NOISE = INFRA | TOOLING | {"flagd-ui", "grafana", "opensearch"}
 
 TEMPLATE_FAULT = {
     "crash": "is crashed",
@@ -33,9 +36,23 @@ class Scored(BaseModel):
 
 
 class RankedItem(BaseModel):
-    candidate_id: str
+    candidate_id: str = ""
+    index: int | None = None
     rank: int
     reason: str = Field(default="")
+
+    @field_validator("candidate_id", mode="before")
+    @classmethod
+    def _id(cls, v):
+        return "" if v is None else str(v).strip()
+
+    @field_validator("index", mode="before")
+    @classmethod
+    def _index(cls, v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
 
     @field_validator("reason", mode="before")
     @classmethod
@@ -229,19 +246,26 @@ def template_reason(s: Scored) -> str:
     return ", ".join(parts)
 
 
+def journey_callers(graph: dict, target: str) -> list[str]:
+    """Direct callers of target that sit on a journey through target; telemetry and tooling edges are ignored."""
+    on = {s for v in (graph.get("journeys") or {}).values() if target in v["services"] for s in v["services"]}
+    return [d for d in dependents(graph, target) if d not in NOISE and d in on]
+
+
 def blast_radius(graph: dict, target: str) -> list[str]:
     js = [f"journey:{j}" for j, v in (graph.get("journeys") or {}).items() if target in v["services"]]
-    return dependents(graph, target) + js
+    return journey_callers(graph, target) + js
 
 
 def template_hypothesis(graph: dict, c: Candidate) -> str:
-    deps = dependents(graph, c.target)
+    deps = journey_callers(graph, c.target)
     js = [j for j, v in (graph.get("journeys") or {}).items() if c.target in v["services"]]
     what = TEMPLATE_FAULT["loss" if c.kind == "loss" else c.fault]
-    return (
-        f"If {c.target} {what} ({c.label}), callers ({', '.join(deps[:6]) or 'none'}) will show errors or higher latency "
-        f"and journeys ({', '.join(js) or 'none'}) will degrade."
-    )
+    head = f"If {c.target} {what} ({c.label})"
+    if not js:
+        return f"{head}, no user journey depends on it; expect no journey to degrade."
+    callers = f"callers on those journeys ({', '.join(deps[:6])}) will show errors or higher latency and " if deps else ""
+    return f"{head}, {callers}journeys ({', '.join(js)}) will degrade."
 
 
 def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], strategy: str | None = None, limits: list[dict] | None = None) -> str:
@@ -260,8 +284,8 @@ def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], 
         for e in hist[:5]
     ) or "none"
     cand = "\n".join(
-        f"- {s.candidate.id} (target {s.candidate.target}, {s.candidate.label}{f', tier {s.candidate.tier}' if strategy else ''}) "
-        f"det_score {s.det_score} {json.dumps(s.components)}" for s in top
+        f"{i}. {s.candidate.id} (target {s.candidate.target}, {s.candidate.label}{f', tier {s.candidate.tier}' if strategy else ''}) "
+        f"det_score {s.det_score} {json.dumps(s.components)}" for i, s in enumerate(top, 1)
     )
     out = (
         f"Services (* stateful): {nodes}\nCalls (caller>callee): {edges}\nJourneys: {journeys}\n"
@@ -277,8 +301,9 @@ def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], 
 SYSTEM = (
     "You are the planner of a chaos engineering tool for a microservice demo shop. Rank the candidate fault experiments "
     "by how much resilience insight they give (hidden dependencies, single points of failure, untested paths). "
-    "Use only the candidate ids given. Reply with one JSON object and nothing else, in this format: "
-    '{"ranking":[{"candidate_id":"<id>","rank":1,"reason":"<=200 chars"}],'
+    "The candidates are a numbered list. Refer to each one by its list number as index AND by its exact id copied from the list, "
+    "never by an id you made up. Reply with one JSON object and nothing else, in this format: "
+    '{"ranking":[{"index":1,"candidate_id":"<id>","rank":1,"reason":"<=200 chars"}],'
     '"hypothesis":"what you expect to happen for the rank 1 pick","predicted_blast_radius":["service or journey names affected by the rank 1 pick"]}. '
     "Include every candidate exactly once."
 )
@@ -290,6 +315,32 @@ RUN_NOTE = (
     " The user message gives the run strategy (survivable first, climb as results come in). "
     "Let your reasons reflect it: say why the pick fits the current tier and what the earlier results suggest."
 )
+
+
+def resolve(r: RankedItem, top: list[Scored], by_id: dict[str, Scored]) -> Scored | None:
+    """The candidate a ranking row names: its exact id, else its list number (also when the id field holds a number)."""
+    if r.candidate_id in by_id:
+        return by_id[r.candidate_id]
+    hit = [i for i in by_id if i in r.candidate_id] if r.candidate_id else []
+    if len(hit) == 1:
+        return by_id[hit[0]]
+    num = r.index
+    if num is None and r.candidate_id.rstrip(".").isdigit():
+        num = int(r.candidate_id.rstrip("."))
+    return top[num - 1] if num is not None and 1 <= num <= len(top) else None
+
+
+def order_ranking(out: PlannerOut | None, top: list[Scored], by_id: dict[str, Scored]) -> tuple[list[Scored], set[str]]:
+    ordered, seen = [], set()
+    if out is None:
+        return ordered, seen
+    for r in sorted(out.ranking, key=lambda r: r.rank):
+        s = resolve(r, top, by_id)
+        if s is not None and s.candidate.id not in seen:
+            seen.add(s.candidate.id)
+            s.llm_rank, s.reason = len(ordered) + 1, r.reason
+            ordered.append(s)
+    return ordered, seen
 
 
 def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier: int | None = None,
@@ -308,23 +359,28 @@ def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier:
             exclusions=excluded, limits=limits,
         )
     ctx = build_context(cfg, graph, store, top, hist, strategy, limits)
-    out, meta = llm.call_structured(
-        "planner", model, PlannerOut, SYSTEM + (RUN_NOTE if strategy else "") + (LIMITS_NOTE if limits else ""), ctx, cfg.llm.timeout_s, store=store,
-        input_summary=f"{len(top)} candidates, {len(graph['nodes'])} nodes, {len(hist)} past experiments", chat=chat,
-    )
+    system = SYSTEM + (RUN_NOTE if strategy else "") + (LIMITS_NOTE if limits else "")
+    summary = f"{len(top)} candidates, {len(graph['nodes'])} nodes, {len(hist)} past experiments"
+    out, meta = llm.call_structured("planner", model, PlannerOut, system, ctx, cfg.llm.timeout_s, store=store, input_summary=summary, chat=chat)
     by_id = {s.candidate.id: s for s in top}
-    ordered, seen = [], set()
-    if out is not None:
-        for r in sorted(out.ranking, key=lambda r: r.rank):
-            if r.candidate_id in by_id and r.candidate_id not in seen:
-                seen.add(r.candidate_id)
-                s = by_id[r.candidate_id]
-                s.llm_rank, s.reason = len(ordered) + 1, r.reason
-                ordered.append(s)
-        if not ordered:
-            out = None
-            meta["error"] = "no valid candidate ids in output"
-            store.add_trace("planner", model, "ranking validation", None, 0.0, True, meta["error"])
+    ordered, seen = order_ranking(out, top, by_id)
+    if out is not None and not ordered:
+        store.add_trace("planner", model, "ranking validation", None, 0.0, True, "no valid candidate ids in output")
+        if meta.get("cache_key"):
+            store.cache_drop(meta["cache_key"])
+        bad = ", ".join(sorted({r.candidate_id for r in out.ranking if r.candidate_id})[:5]) or "none"
+        fix = (
+            f"\nYour previous answer used ids that are not in the list ({bad}). Valid ids: {', '.join(by_id)}. "
+            "Answer again with the same JSON format, giving each candidate's list number as index and its exact id."
+        )
+        out, meta = llm.call_structured(
+            "planner", model, PlannerOut, system, ctx + fix, cfg.llm.timeout_s, store=store, input_summary=summary + " (id retry)", chat=chat, cache=False,
+        )
+        ordered, seen = order_ranking(out, top, by_id)
+    if out is not None and not ordered:
+        out = None
+        meta["error"] = "no valid candidate ids in output"
+        store.add_trace("planner", model, "ranking validation", None, 0.0, True, meta["error"])
     fallback = out is None
     for s in top:
         if s.candidate.id not in seen:

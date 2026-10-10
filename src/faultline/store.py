@@ -130,7 +130,7 @@ MIGRATIONS = {
     "agent_trace": {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"},
     "experiments": {
         "abort_source": "TEXT", "safety_checks": "INTEGER NOT NULL DEFAULT 0", "safety_decisions": "TEXT",
-        "preflight_review": "TEXT",
+        "preflight_review": "TEXT", "recovery_measured": "INTEGER",
     },
     "runs": {"memory": "TEXT"},
     "run_rounds": {"preflight": "TEXT"},
@@ -245,6 +245,13 @@ class Store:
                     "INSERT OR REPLACE INTO llm_cache (key, model, created_at, output_json) VALUES (?, ?, ?, ?)",
                     (key, model, time.time(), output_json),
                 )
+        except sqlite3.Error:
+            pass
+
+    def cache_drop(self, key: str):
+        try:
+            with self.conn:
+                self.conn.execute("DELETE FROM llm_cache WHERE key = ?", (key,))
         except sqlite3.Error:
             pass
 

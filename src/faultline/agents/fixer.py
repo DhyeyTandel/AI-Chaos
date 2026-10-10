@@ -67,6 +67,14 @@ SYSTEM = (
 )
 
 
+SIMPLE_SYSTEM = (
+    "You are the fixer of a chaos engineering tool for a Docker Compose microservice demo shop. For each weakness propose one "
+    "concrete fix. Reply with one short JSON object: "
+    '{"fixes":[{"weakness_rank":1,"fix_title":"short","fix_type":"config|code|architecture","steps":"<=250 chars",'
+    '"expected_effect":"<=120 chars"}]}. No compose YAML. One fix per weakness. Plain ASCII only.'
+)
+
+
 def check_override(text: str, services: set[str], default_svc: str | None = None) -> tuple[str | None, str | None]:
     """Returns (normalised yaml, None) when valid, else (None, reason). A bare service body is wrapped under default_svc."""
     try:
@@ -150,7 +158,7 @@ def fix(cfg, store, analysis: dict, graph: dict, weaknesses: list[Weakness], cha
     by_id = {a["experiment_id"]: a for a in analysis["experiments"]}
     out, meta = llm.call_structured(
         "fixer", model, FixerOut, SYSTEM, context(analysis, graph, weaknesses), cfg.llm.timeout_s, store=store,
-        input_summary=f"{len(weaknesses)} weaknesses", chat=chat,
+        input_summary=f"{len(weaknesses)} weaknesses", chat=chat, simple={"system": SIMPLE_SYSTEM},
     )
     ranks = {w.rank: w for w in weaknesses}
     fixes: dict[int, Fix] = {}

@@ -1,4 +1,4 @@
-import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -65,6 +65,25 @@ SYSTEM = (
 )
 
 
+SIMPLE_SYSTEM = (
+    "You are the analyst of a chaos engineering tool for a microservice demo shop. Rank the real weaknesses in the measured "
+    "experiment results. Use only experiment ids and service names from the input. Recovery at or below the stated floor is normal. "
+    'Reply with one short JSON object: {"weaknesses":[{"rank":1,"title":"short","severity":"critical|high|medium|low",'
+    '"services":["svc"],"explanation":"<=200 chars","evidence":"<=120 chars","related_experiment_ids":["exp-id"]}],'
+    '"executive_summary":"<=300 chars"}. At most 3 weaknesses. Plain ASCII only.'
+)
+RECOVERY_TITLE = re.compile(r"recover|restart time|slow to come back|time to restore", re.I)
+
+
+def recovery_is_normal(analysis: dict, ids, floor_s: float) -> bool:
+    """True when no experiment among ids has a measured recovery above the floor or a never-recovered result."""
+    by = {a["experiment_id"]: a for a in analysis["experiments"]}
+    return all(
+        not by[i]["never_recovered"] and (by[i]["recovery_s"] is None or by[i]["recovery_s"] <= floor_s)
+        for i in ids if i in by
+    )
+
+
 def compact(analysis: dict, limit: int = 14, floor_s: float = 5.0) -> str:
     rows = sorted((a for a in analysis["experiments"] if a["injected"]), key=lambda a: -a["penalty"])[:limit]
     lines = []
@@ -73,21 +92,24 @@ def compact(analysis: dict, limit: int = 14, floor_s: float = 5.0) -> str:
             f"{a['experiment_id']} {a['label']} on {a['target']} ({a['scope']}) outcome {a['outcome']}"
             f"{' abort: ' + a['abort_reason'][:80] if a['abort_reason'] else ''}; predicted journeys {','.join(a['predicted_journeys']) or 'none'}; "
             f"degraded {','.join(a['affected_journeys']) or 'none'}; impact {a['impact']:.2f} breadth {a['breadth']:.2f} "
-            f"recovery {'never' if a['never_recovered'] else a['recovery_s'] if a['recovery_s'] is not None else '-'}; "
+            f"recovery {'never' if a['never_recovered'] else ('not measured' if not a['recovery_measured'] else '-') if a['recovery_s'] is None else format(a['recovery_s'], '.1f') + (' (at floor, normal)' if a['recovery_s'] <= floor_s else '')}; "
             f"penalty {a['penalty']:.0f}; verdict {a['verdict']}"
             f"{'; HIDDEN dependency on ' + ','.join(a['hidden_journeys']) if a['hidden_journeys'] else ''}"
         )
     svc = "; ".join(f"{t} {v['score']:.0f}" for t, v in analysis["services"].items())
     return (
-        f"Overall resilience score: {analysis['overall']}\nRecovery measurement floor: {floor_s:g}s (needs that many probe samples back inside baseline)\nService scores: {svc or 'none'}\n"
+        f"Overall resilience score: {analysis['overall']}\nRecovery measurement floor: {floor_s:g}s (a recovery at or below it is normal, not a weakness)\nService scores: {svc or 'none'}\n"
         f"Untested services: {', '.join(analysis['untested']) or 'none'}\nExperiments (worst first):\n" + "\n".join(lines)
     )
 
 
-def validate(out: AnalystOut, exp_ids: set[str], services: set[str], max_n: int) -> tuple[list[Weakness], int]:
+def validate(out: AnalystOut, exp_ids: set[str], services: set[str], max_n: int, analysis: dict | None = None, floor_s: float | None = None) -> tuple[list[Weakness], int]:
     good, dropped = [], 0
     for w in sorted(out.weaknesses, key=lambda w: w.rank):
         if not w.related_experiment_ids or any(i not in exp_ids for i in w.related_experiment_ids) or any(s not in services for s in w.services):
+            dropped += 1
+            continue
+        if analysis is not None and floor_s is not None and RECOVERY_TITLE.search(w.title) and recovery_is_normal(analysis, w.related_experiment_ids, floor_s):
             dropped += 1
             continue
         good.append(w)
@@ -97,14 +119,25 @@ def validate(out: AnalystOut, exp_ids: set[str], services: set[str], max_n: int)
     return good, dropped
 
 
+def non_recovery_penalty(cfg, a: dict) -> float:
+    """Penalty without the recovery part when recovery sits at or below the measurement floor."""
+    if a["never_recovered"] or (a["recovery_s"] is not None and a["recovery_s"] > cfg.score.recovery_floor_s):
+        return a["penalty"]
+    return a["penalty"] - 100.0 * cfg.score.recovery_weight * a["recovery_norm"]
+
+
 def fallback_weaknesses(cfg, analysis: dict) -> list[Weakness]:
-    rows = [a for a in analysis["experiments"] if a["injected"] and a["penalty"] >= cfg.score.weak_min_penalty]
+    rows = [a for a in analysis["experiments"] if a["injected"] and non_recovery_penalty(cfg, a) >= cfg.score.weak_min_penalty]
     best: dict[str, dict] = {}
     for a in sorted(rows, key=lambda a: -a["penalty"]):
         best.setdefault(a["target"], a)
     out = []
     for i, a in enumerate(sorted(best.values(), key=lambda a: -a["penalty"])[: cfg.score.max_weaknesses], 1):
-        rec = "never recovered" if a["never_recovered"] else f"recovered in {a['recovery_s']:.1f}s" if a["recovery_s"] is not None else "recovery not measured"
+        floor = cfg.score.recovery_floor_s
+        rec = (
+            "never recovered" if a["never_recovered"] else "recovery not measured" if a["recovery_s"] is None
+            else f"recovered in {a['recovery_s']:.1f}s" if a["recovery_s"] > floor else "recovered at the measurement floor"
+        )
         hidden = f" Unpredicted impact on {', '.join(a['hidden_journeys'])}: a hidden dependency." if a["hidden_journeys"] else ""
         out.append(Weakness(
             rank=i, title=f"{a['target']} is a weak point under {a['label']}", severity=analyzer.severity_of(a["penalty"]),
@@ -130,15 +163,17 @@ def analyze(cfg, store, analysis: dict, known_services: set[str], chat=None) -> 
     model = cfg.llm.analyst_model
     exp_ids = {a["experiment_id"] for a in analysis["experiments"]}
     services = known_services | {a["target"] for a in analysis["experiments"]}
+    floor = cfg.score.recovery_floor_s
     out, meta = None, {"error": "no injected experiments"}
     if any(a["injected"] for a in analysis["experiments"]):
         out, meta = llm.call_structured(
-            "analyst", model, AnalystOut, SYSTEM, compact(analysis, floor_s=cfg.recovery.min_samples * 1.0), cfg.llm.timeout_s, store=store,
+            "analyst", model, AnalystOut, SYSTEM, compact(analysis, floor_s=floor), cfg.llm.timeout_s, store=store,
             input_summary=f"{len(analysis['experiments'])} analyzed experiments, overall {analysis['overall']}", chat=chat,
+            simple={"system": SIMPLE_SYSTEM, "user": compact(analysis, limit=8, floor_s=floor)},
         )
     dropped = 0
     if out is not None:
-        good, dropped = validate(out, exp_ids, services, cfg.score.max_weaknesses)
+        good, dropped = validate(out, exp_ids, services, cfg.score.max_weaknesses, analysis, floor)
         if good:
             return AnalystResult(weaknesses=good, executive_summary=out.executive_summary, fallback=False, model=model, dropped=dropped)
         meta["error"] = "no valid weaknesses in output"

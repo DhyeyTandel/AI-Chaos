@@ -228,7 +228,7 @@ def _print_experiment(e: dict):
     rec = e["recovery_seconds"]
     t.add_row(
         e["id"], e["fault"], e["target"], e["state"],
-        "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}"),
+        "not measured" if rec is None and e.get("recovery_measured") == 0 else "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}"),
         e["abort_reason"] or "-",
         style="red" if e["state"] in ("ABORTED", "VETOED") else "green",
     )
@@ -421,6 +421,12 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
     raise typer.Exit(0 if pick else 1)
 
 
+def _round_rec(r: dict) -> str:
+    if r["recovery_s"] is not None:
+        return _fmt(r["recovery_s"], "{:.1f}")
+    return "not measured" if runs_mod.is_operator_stop(r["abort_reason"]) else "never"
+
+
 def _round_source(r: dict) -> str:
     return "FALLBACK" if r["fallback"] else f"LLM #{r['llm_rank'] or '-'}"
 
@@ -432,7 +438,7 @@ def _print_round(r: dict, total: int):
     )
     console.print(f"  {src}: {r['reason']}", markup=False, highlight=False)
     console.print(
-        f"  outcome {r['outcome']}  recovery {'never' if r['recovery_s'] is None else _fmt(r['recovery_s'], '{:.1f}') + 's'}"
+        f"  outcome {r['outcome']}  recovery {_round_rec(r)}{'' if r['recovery_s'] is None else 's'}"
         + (f"  abort: {r['abort_reason']}" if r["abort_reason"] else ""),
         markup=False, highlight=False,
     )
@@ -445,7 +451,7 @@ def _print_run(run: dict, rows: list[dict]):
     for r in rows:
         t.add_row(
             str(r["round"]), str(r["tier"]), r["candidate_id"], _round_source(r), r["outcome"] or "-",
-            "never" if r["recovery_s"] is None else _fmt(r["recovery_s"], "{:.1f}"), r["climb_decision"] or "-",
+            _round_rec(r), r["climb_decision"] or "-",
             style="red" if r["outcome"] == "ABORTED" else None,
         )
     console.print(t)

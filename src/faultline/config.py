@@ -68,6 +68,7 @@ DEFAULTS = {
         "breadth_weight": 0.3,
         "recovery_weight": 0.2,
         "recovery_cap_s": 60,
+        "recovery_floor_s": 6,
         "err_full": 0.5,
         "p95_full_ratio": 10.0,
         "p95_base_floor_ms": 100,

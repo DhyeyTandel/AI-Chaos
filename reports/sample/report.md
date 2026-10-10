@@ -2,77 +2,40 @@
 
 | Run | Started | Ended | Rounds | Final tier | Stop reason |
 |---|---|---|---|---|---|
-| run-165931-61dc | 2026-10-10 16:59:31 UTC | 2026-10-10 17:01:48 UTC | 3/3 | 2 | completed 3 rounds |
+| run-184204-9283 | 2026-10-10 18:42:04 UTC | 2026-10-10 18:43:22 UTC | 2/2 | 2 | completed 2 rounds |
 
-**37.5 / 100**  
-Overall resilience score (poor). Generated 2026-10-10 17:01:55 UTC.
+**39.6 / 100**  
+Overall resilience score (poor). Generated 2026-10-10 18:43:30 UTC.
 
 ## Executive summary
 
-The shop's resilience is compromised by several critical weaknesses. A hidden coupling between astronomy-db and checkout causes checkout latency breaches even when not predicted, making checkout vulnerable to unrelated service slowdowns. The cart service itself is a single point of failure; its crash aborts all cart journeys. Front-end components (frontend, frontend-proxy, product-catalog) amplify tiny delays into system-wide outages, showing an overly broad blast radius. Additionally, the valkey-cart cache and flagd service expose hidden dependencies that can cascade failures to the cart. Add
+The shop's resilience is compromised by several critical weaknesses. A hidden dependency links astronomy-db to checkout, causing checkout failures whenever astronomy-db is delayed. Core caches and services (valkey-cart, flagd, cart) act as single points of failure, each crashing and halting cart operations with no fallback. Additionally, product-catalog delays have a wide blast radius, degrading all primary journeys. Addressing these hidden couplings, adding redundancy, and isolating blast zones are top priorities to improve the overall score.
 
 ## Ranked weaknesses and proposed fixes
 
 Fixes are proposals only. Nothing was applied to the running system.
 
-### 1. Hidden checkout dependency [CRITICAL]
+### 1. Hidden checkout dependency via astronomy-db [CRITICAL]
 
 Services: astronomy-db. Experiments: exp-143142-3011, exp-163723-5939, exp-141736-9801, exp-165933-0066. Source: llm.
 
-Delays on astronomy-db repeatedly breach the checkout latency threshold (>800 ms) even though checkout was not in the predicted journey map, indicating an undocumented coupling that can degrade checkout performance across all user flows.
+Delays on astronomy-db unexpectedly degrade checkout journeys, revealing a hidden coupling not captured in the service map. This can cause checkout latency spikes and aborts when astronomy-db is slow, threatening revenue flow.
 
-Evidence: exp-143142-3011, exp-163723-5939, exp-141736-9801, exp-165933-0066 all show checkout p95 >800 ms, impact 1.00, breadth 1.00, penalty 82-66.
+Evidence: exp-143142-3011, exp-163723-5939, exp-141736-9801, exp-165933-0066 all show checkout p95 >800ms and degraded checkout despite not being predicted.
 
-Proposed fix (code, llm): Add timeout and retry to checkout calls to astronomy-db. Wrap all calls from checkout service to astronomy-db with a client library that sets a 200 ms timeout and retries up to 2 times with exponential backoff. Log fallback latency. This isolates checkout from transient DB delays.
+Proposed fix (code, llm): Add circuit breaker & cache for astronomy-db calls. In the checkout service, wrap all calls to astronomy-db with a circuit-breaker library (e.g., resilience4j). Configure a 100 ms timeout, open the circuit after 3 failures, and provide a fallback that returns cached astronomy data populated at startup and refreshed asynchronously. Log circuit state changes for observability.
 
-Expected effect: Checkout latency stays under 800 ms even when astronomy-db experiences 100-300 ms delays.
+Expected effect: Checkout latency stays below p95 threshold even when astronomy-db is delayed; aborts are avoided and revenue flow is protected.
 
-### 2. Cart service single point of failure [HIGH]
-
-Services: cart. Experiments: exp-142250-d200. Source: llm.
-
-A crash of the cart service aborts all cart-related journeys, causing a full-impact outage (impact 1.00) despite a limited blast radius, revealing the cart as a critical single point of failure.
-
-Evidence: exp-142250-d200 crash on cart, impact 1.00, breadth 0.25, recovery 6.01 s, penalty 60.
-
-Proposed fix (config, llm): Run cart service with replica and restart. Update docker-compose to define two replicas of cart service and set restart: unless-stopped. Use deploy.resources limits to ensure each replica gets sufficient CPU/memory.
-
-Compose override (not applied):
-
-```
-services:
-  cart:
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-```
-
-Expected effect: Cart crash affects only one replica; other continues serving, eliminating full-outage.
-
-### 3. Broad blast radius from frontend delays [HIGH]
-
-Services: frontend, frontend-proxy, product-catalog. Experiments: exp-141542-f9bb, exp-164224-dcfe, exp-170022-0d38. Source: llm.
-
-Small latency injections (100 ms) on frontend-related services trigger watchdog breaches across all major journeys, showing that latency in these front-door components propagates system-wide.
-
-Evidence: exp-141542-f9bb (frontend), exp-164224-dcfe (product-catalog), exp-170022-0d38 (frontend-proxy) each have impact 1.00, breadth 1.00 (or 0.75), penalty >=53.
-
-Proposed fix (code, llm): Circuit breaker on frontend entry points. Introduce a circuit-breaker middleware in frontend and frontend-proxy that opens after 3 consecutive >100 ms responses, returning a cached fallback page. Include retry with short back-off for product-catalog calls.
-
-Expected effect: Latency spikes in entry services no longer cascade, keeping overall journeys within thresholds.
-
-### 4. Valkey-cart cache single point [MEDIUM]
+### 2. Single point of failure: valkey-cart [HIGH]
 
 Services: valkey-cart. Experiments: exp-104221-fd4f. Source: llm.
 
-Crashing the in-memory cache degrades the cart journey to the maximum impact, indicating that loss of the cache cannot be tolerated without severe user-experience degradation.
+A crash of valkey-cart aborts all cart journeys with impact 1.00 but affects only the cart (breadth 0.25), showing no fallback or redundancy for the core cart cache.
 
-Evidence: exp-104221-fd4f crash on valkey-cart, impact 1.00, breadth 0.25, recovery 6.01 s, penalty 60.
+Evidence: exp-104221-fd4f crash on valkey-cart caused cart p95 3007ms, degraded cart only, breadth 0.25.
 
-Proposed fix (config, llm): Add replica and fallback for valkey-cart. Deploy two instances of valkey-cart with restart: unless-stopped. Configure cart service to fall back to persistent DB if both caches miss or are unavailable.
+Proposed fix (config, llm): Enable restart policy for valkey-cart and add in-process fallback. Edit docker-compose.yml to add restart: unless-stopped for valkey-cart. In the cart service, add a lightweight in-memory cache that is used when Redis is unavailable, populated from Redis on successful connections. This provides continuity until Redis restarts.
 
 Compose override (not applied):
 
@@ -80,36 +43,60 @@ Compose override (not applied):
 services:
   valkey-cart:
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 256M
 ```
 
-Expected effect: Cache crash no longer degrades cart journey; cart continues using DB fallback.
+Expected effect: A valkey-cart crash triggers automatic container restart; cart requests fall back to in-process cache, preventing total cart outage.
 
-### 5. Flagd hidden cart dependency [MEDIUM]
+### 3. Single point of failure: flagd with hidden cart dependency [HIGH]
 
 Services: flagd. Experiments: exp-141616-6842. Source: llm.
 
-A crash of flagd, though refuted, still shows an undocumented dependency on the cart service, causing cart latency spikes and highlighting hidden coupling that could surface under real failures.
+Flagd crash aborts cart journeys, indicating an undocumented dependency of the cart on flagd. No other journeys are affected, exposing a fragile link in the checkout path.
 
-Evidence: exp-141616-6842 crash on flagd, hidden dependency on cart, impact 1.00, breadth 0.25, penalty 60.
+Evidence: exp-141616-6842 crash on flagd caused cart p95 3051ms, degraded cart only, breadth 0.25, hidden dependency on cart.
 
-Proposed fix (code, llm): Feature flag client with timeout and fallback. Wrap flagd client in cart service with a 150 ms timeout and default flag values. On timeout or error, use cached defaults to avoid latency spikes.
+Proposed fix (code, llm): Circuit-break flagd calls in cart service. Introduce a circuit-breaker around every flagd request in the cart service (e.g., using opossum). Set a 50 ms timeout and a fallback that returns default flag values. Record metrics for circuit state to aid debugging.
 
-Expected effect: Flagd failure does not propagate latency to cart, removing hidden coupling impact.
+Expected effect: Cart journeys continue with sensible defaults when flagd crashes, eliminating the hidden dependency impact.
+
+### 4. Single point of failure: cart service [HIGH]
+
+Services: cart. Experiments: exp-142250-d200. Source: llm.
+
+The cart service crash directly aborts cart journeys with impact 1.00 and breadth 0.25, confirming the cart as a critical single point without automatic failover.
+
+Evidence: exp-142250-d200 crash on cart caused cart p95 3007ms, degraded cart only, breadth 0.25.
+
+Proposed fix (config, llm): Add restart policy for cart service. Update docker-compose.yml to set restart: unless-stopped for the cart service. Optionally define modest CPU/memory limits under deploy.resources to keep the container lightweight. This ensures the cart container is automatically relaunched after a crash.
+
+Compose override (not applied):
+
+```
+services:
+  cart:
+    restart: unless-stopped
+```
+
+Expected effect: Cart service recovers automatically after a crash, reducing downtime and keeping cart journeys available.
+
+### 5. Wide blast radius: product-catalog delays [HIGH]
+
+Services: product-catalog. Experiments: exp-164224-dcfe. Source: llm.
+
+A 300 ms delay on product-catalog triggers watchdog breaches across cart, checkout, home, and product journeys, degrading all major user flows and showing a large blast radius.
+
+Evidence: exp-164224-dcfe delay 300ms on product-catalog caused product p95 1226ms, cart p95 1250ms, degraded cart,checkout,home,product, breadth 1.00.
+
+Proposed fix (code, llm): Timeout, retries and caching for product-catalog calls. Wrap product-catalog client calls in all dependent services with a wrapper that enforces a 200 ms timeout, performs up to 2 retries with exponential backoff, and caches successful responses for 5 minutes. Use a library like axios-retry or similar. Log retry attempts and cache hits.
+
+Expected effect: Downstream services tolerate product-catalog latency spikes, preventing watchdog breaches and limiting blast radius across all journeys.
 
 ## Experiments in this run
 
 | Round | Tier | Fault | Target | AI reason | Hypothesis | Verdict | Degraded journeys | Impact | Breadth | Recovery | Penalty | Safety review | Safety agent | Outcome |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 1 | delay 50ms | astronomy-db | Highest det_score and stateful; close to known abort limit (300ms) so 50ms is safe yet probes hidden DB dependency across multiple journeys. | Injecting a 50 ms delay into astronomy-db will increase latency of home, product, and cart journeys, exposing any hidden dependency on th... | PARTIAL | cart, checkout, home, product | 0.70 | 1.00 | 5.0s | 66 | approved: delay 50ms < known abort threshold 100ms, tier1, no recent aborts | 2 checks: 1 continue, 1 abort, 0 ignored | ABORTED by safety_agent (safety agent: checkout p95 285ms > baseline 74ms, outside...) |
-| 2 | 1 | delay 50ms | frontend-proxy | Delays a hub that all journeys pass through; shows single-point impact and tests latency tolerance. | If frontend-proxy gets added network latency (delay 50ms), callers (otel-collector) will show errors or higher latency and journeys (home... | PARTIAL | cart, checkout, home | 0.57 | 0.75 | 5.0s | 53 | approved: Tier1, 50ms delay completed before, no aborts at this intensity | 2 checks: 2 continue, 0 abort, 0 ignored | COMPLETED |
-| 3 | 1 | delay 50ms | cart | Tier 1 light delay on cart, highest det_score and 0.5 journey impact; recent result survived, so fits survivable tier and probes a statef... | Injecting a 50 ms delay into the cart service will increase latency of the checkout journey and may cause degraded p95 for checkout while... | CONFIRMED | cart, checkout | 0.83 | 0.50 | 5.0s | 58 | approved: Tier1 delay 50ms, duration 20s within abort limits; no prior aborts at this intensity; recent 100ms fronten... | 2 checks: 2 continue, 0 abort, 0 ignored | COMPLETED |
-
-Vetoed by the pre-flight safety review (not injected, not counted as aborts): round 2 crash:image-provider:20s (Crash on image-provider likely breaches frontend abort limits (100ms delay aborted), recent similar abort observed.)
+| 1 | 1 | crash | image-provider | Tier 1 crash of image-provider is untested, high fan-in and severity 1, exposing hidden dependencies (frontend-proxy, load-generator) wit... | Crashing image-provider for 20 s will cause frontend-proxy and load-generator requests to fail, revealing hidden dependencies and confirm... | CONFIRMED | none | 0.00 | 0.00 | 5.0s | 2 | reduced duration 20 -> 10 s: Crash may exceed 20% err; recent abort on frontend loss 10% suggests caution. Reduce dur... | 1 checks: 1 continue, 0 abort, 0 ignored | COMPLETED |
+| 2 | 1 | delay 50ms | flagd | Tier 1 light delay on flagd sits near the known crash limit for flagd and has the highest fan-in, exposing hidden cross-service dependenc... | Injecting a 50 ms delay into flagd will surface hidden dependencies across multiple services, causing measurable latency spikes in downst... | CONFIRMED | cart, checkout | 0.44 | 0.50 | 5.0s | 38 | approved: delay 50ms on flagd, tier1, predicted p95 ~120ms < abort 800ms, similar to cart delay 50ms completed | 2 checks: 2 continue, 0 abort, 0 ignored | COMPLETED |
 
 ## Earlier experiments in the database
 
@@ -145,6 +132,13 @@ These ran before this run and count toward service scores and hidden dependency 
 | exp-164043-141e | delay 50ms | flagd | cart, checkout | 0.44 | 0.50 | 5.0s | 38 | COMPLETED |
 | exp-164133-9202 | delay 50ms | frontend-proxy | cart, checkout, home | 0.57 | 0.75 | 5.0s | 53 | COMPLETED |
 | exp-164224-dcfe | delay 300ms | product-catalog | cart, checkout, home, product | 1.00 | 1.00 | 5.0s | 82 | ABORTED |
+| exp-165933-0066 | delay 50ms | astronomy-db | cart, checkout, home, product | 0.70 | 1.00 | 5.0s | 66 | ABORTED |
+| exp-170022-0d38 | delay 50ms | frontend-proxy | cart, checkout, home | 0.57 | 0.75 | 5.0s | 53 | COMPLETED |
+| exp-170114-0a67 | delay 50ms | cart | cart, checkout | 0.83 | 0.50 | 5.0s | 58 | COMPLETED |
+| exp-173527-9957 | delay 50ms | valkey-cart | cart, checkout | 0.63 | 0.50 | 5.0s | 48 | COMPLETED |
+| exp-173618-19fc | delay 50ms | frontend-proxy | cart, checkout, home | 0.57 | 0.75 | 5.0s | 52 | COMPLETED |
+| exp-173710-08a3 | loss 10% | frontend | cart, checkout, home | 0.96 | 0.75 | 5.0s | 72 | ABORTED |
+| exp-183210-dd26 | delay 50ms | quote | checkout | 0.23 | 0.25 | not measured | 19 | ABORTED |
 
 ## Learned limits
 
@@ -152,14 +146,19 @@ Lowest fault intensity per target and fault kind that the watchdog or safety age
 
 | Target | Fault | Lowest aborted intensity | Aborted by | Evidence |
 |---|---|---|---|---|
-| astronomy-db | delay | 300 ms | watchdog | exp-143142-3011 |
+| astronomy-db | delay | 50 ms | safety_agent | exp-165933-0066 |
 | cart | crash | crash | watchdog | exp-142250-d200 |
 | flagd | crash | crash | watchdog | exp-141616-6842 |
 | frontend | delay | 100 ms | watchdog | exp-141542-f9bb |
+| frontend | loss | 10 % | watchdog | exp-173710-08a3 |
 | product-catalog | delay | 100 ms | watchdog | exp-141653-b9e0 |
 | valkey-cart | crash | crash | watchdog | exp-104221-fd4f |
 
-New limits learned in this run: delay 50ms on astronomy-db aborted by safety_agent (exp-165933-0066).
+Candidates excluded during this run:
+
+| Candidate | Reason | Evidence |
+|---|---|---|
+| delay:astronomy-db:50ms | delay on astronomy-db aborted at 50 ms in exp-165933-0066; 50 ms excluded | exp-165933-0066 |
 
 ## Hidden dependencies
 
@@ -168,7 +167,7 @@ New limits learned in this run: delay 50ms on astronomy-db aborted by safety_age
 | exp-141616-6842 | history | crash | flagd | cart | 1.00 | map shows no journey depending on it |
 | exp-143142-3011 | history | delay 300ms | astronomy-db | checkout | 1.00 | map lists journeys cart, home, product |
 | exp-163723-5939 | history | delay 300ms | astronomy-db | checkout | 1.00 | map lists journeys cart, home, product |
-| exp-165933-0066 | run | delay 50ms | astronomy-db | checkout | 0.70 | map lists journeys cart, home, product |
+| exp-165933-0066 | history | delay 50ms | astronomy-db | checkout | 0.70 | map lists journeys cart, home, product |
 | exp-141736-9801 | history | delay 100ms | astronomy-db | checkout | 0.67 | map lists journeys cart, home, product |
 | exp-142108-4440 | history | delay 50ms | astronomy-db | checkout | 0.44 | map lists journeys cart, home, product |
 | exp-164043-141e | history | delay 50ms | flagd | checkout | 0.44 | map shows no journey depending on it |
@@ -178,17 +177,18 @@ New limits learned in this run: delay 50ms on astronomy-db aborted by safety_age
 | Service | Score | Worst experiment | Fault | Experiments | Weight |
 |---|---|---|---|---|---|
 | astronomy-db | 18.3 | exp-143142-3011 | delay 300ms | 5 | 4 |
-| frontend | 18.3 | exp-141542-f9bb | delay 100ms | 1 | 4 |
+| frontend | 18.3 | exp-141542-f9bb | delay 100ms | 2 | 4 |
 | product-catalog | 18.3 | exp-164224-dcfe | delay 300ms | 2 | 4 |
 | cart | 40.5 | exp-142250-d200 | crash | 2 | 2 |
-| flagd | 40.5 | exp-141616-6842 | crash | 2 | 2 |
-| valkey-cart | 40.5 | exp-104221-fd4f | crash | 2 | 2 |
-| frontend-proxy | 47.3 | exp-170022-0d38 | delay 50ms | 3 | 4 |
+| flagd | 40.5 | exp-141616-6842 | crash | 3 | 2 |
+| valkey-cart | 40.5 | exp-104221-fd4f | crash | 3 | 2 |
+| frontend-proxy | 47.3 | exp-170022-0d38 | delay 50ms | 4 | 4 |
 | currency | 60.2 | exp-100938-5e55 | loss 10% | 11 | 4 |
-| quote | 60.2 | exp-140231-db3a | delay 100ms | 2 | 1 |
+| quote | 60.2 | exp-140231-db3a | delay 100ms | 3 | 1 |
+| image-provider | 98.3 | exp-184207-ebed | crash | 1 | 1 |
 | recommendation | 98.3 | exp-100645-5f9e | loss 10% | 1 | 1 |
 
-Untested services (excluded from the overall score): accounting, ad, checkout, email, fraud-detection, image-provider, kafka, payment, shipping
+Untested services (excluded from the overall score): accounting, ad, checkout, email, fraud-detection, kafka, payment, shipping
 
 ## Score formula
 
@@ -200,7 +200,7 @@ overall = mean of service scores weighted by journey dependency
 
 - impact: worst journey degradation in the fault window. Per journey, max(error part, latency part). Error part = (error rate - baseline error rate) / 0.5, clamped to 0..1. Latency part = ln(p95 / max(baseline p95, 100 ms)) / ln(10), clamped to 0..1.
 - breadth: affected journeys / all journeys. A journey is affected when its degradation is at least 0.2 or it breaches the baseline threshold.
-- recovery: min(1, recovery seconds / 60); a fault that never recovered scores 1. Recovery is measured from the revert until the journeys are back inside the baseline band.
+- recovery: min(1, recovery seconds / 60); a fault that never recovered scores 1, and an experiment stopped by the operator before recovery was measured contributes 0. Recovery is measured from the revert until the journeys are back inside the baseline band.
 - overall weights: each service counts once per journey it sits on in the dependency map (at least 1); a service seen degrading more journeys than the map lists uses the observed count. Untested services are excluded and listed.
 - rating: 80 and above good, 60 to 79 fair, below 60 poor.
 
@@ -217,13 +217,15 @@ overall = mean of service scores weighted by journey dependency
 
 | Agent | Path | Groq calls | Fallbacks | Cached | Prompt tokens | Completion tokens |
 |---|---|---|---|---|---|---|
-| planner | groq openai/gpt-oss-120b | 3 | 0 | 0 | 5613 | 1787 |
-| safety | groq openai/gpt-oss-20b | 10 | 0 | 0 | 6570 | 793 |
-| analyst | groq openai/gpt-oss-120b | 1 | 0 | 0 | 1560 | 1744 |
-| fixer | groq openai/gpt-oss-120b | 1 | 0 | 0 | 901 | 1292 |
+| planner | groq openai/gpt-oss-120b | 2 | 0 | 0 | 3839 | 1098 |
+| safety | groq openai/gpt-oss-20b | 5 | 0 | 0 | 3331 | 567 |
+| analyst | groq openai/gpt-oss-120b | 1 | 0 | 0 | 1577 | 1949 |
+| fixer | groq openai/gpt-oss-120b | 1 | 0 | 0 | 852 | 1332 |
 
-Safety agent: 6 checks across 3 experiments (continue 5, abort 1, ignored 0). Aborts by watchdog: 0, by safety agent: 1. Ignored checks (timeout, rate limit, invalid output or budget) leave the watchdog verdict standing.
+Safety agent: 3 checks across 2 experiments (continue 3, abort 0, ignored 0). Aborts by watchdog: 0, by safety agent: 0. Ignored checks (timeout, rate limit, invalid output or budget) leave the watchdog verdict standing.
 
-Pre-flight review: 3 reviews of executed experiments (approve 3, reduce 0, fallback approvals 0) and 1 vetoes that skipped a candidate. A veto counts as a planner attempt, not as an abort. A failed review approves, and the validator and watchdog still apply.
+Pre-flight review: 2 reviews of executed experiments (approve 1, reduce 1, fallback approvals 0) and 0 vetoes that skipped a candidate. A veto counts as a planner attempt, not as an abort. A failed review approves, and the validator and watchdog still apply.
 
 Analyst weaknesses dropped by validation: 0. Fixes filled by the rule-based catalog: 0.
+
+Recovery was not measured for exp-183210-dd26 (stopped by the operator before recovery could be measured). Their recovery component is excluded from the penalty (counted as 0), not scored as never recovered.

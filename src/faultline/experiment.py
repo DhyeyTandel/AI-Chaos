@@ -116,6 +116,7 @@ async def run_experiment(
     )
     beat_task = asyncio.create_task(beat())
     state, reason, recovery = "ABORTED", None, None
+    not_measured = False
     source = None
     monitor = None
     t_inject = t_revert = None
@@ -192,6 +193,7 @@ async def run_experiment(
                 if watchdog.recovered(rows_since(t_revert), thresholds, now, t_revert, cfg):
                     recovery = now - t_revert
                     break
+        not_measured = recovery is None and stop.is_set() and not bad
         state = "COMPLETED" if reason is None else "ABORTED"
     finally:
         probe_stop.set()
@@ -214,6 +216,7 @@ async def run_experiment(
         _update(
             store, exp_id, state=state, abort_reason=reason, recovery_seconds=recovery,
             finished_at=time.time(), impact=json.dumps(impact) if impact else None,
+            recovery_measured=None if t_inject is None else 0 if not_measured else 1,
             abort_source=source if state == "ABORTED" else None, safety_checks=len(checks),
             safety_decisions=json.dumps(checks) if checks else None,
         )

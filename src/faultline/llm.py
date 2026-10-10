@@ -143,66 +143,56 @@ def _is_timeout(e: Exception) -> bool:
     return "timeout" in type(e).__name__.lower()
 
 
-def call_structured(agent, model, schema: type[BaseModel], system, user, timeout_s=None, store=None, input_summary=None, chat=None, cache=True):
-    """Returns (parsed | None, meta). Never raises. Every call is written to agent_trace when a store is given."""
+def is_json_gen_error(e: Exception) -> bool:
+    """Groq 400 raised when json_object mode could not produce valid JSON."""
+    if getattr(e, "status_code", None) != 400:
+        return False
+    t = str(e).lower()
+    return "failed to generate json" in t or "json_validate_failed" in t
+
+
+def call_structured(agent, model, schema: type[BaseModel], system, user, timeout_s=None, store=None, input_summary=None, chat=None, cache=True,
+                    simple: dict | None = None):
+    """Returns (parsed | None, meta). Never raises. Every call is written to agent_trace when a store is given.
+    simple, when given ({"system": ..., "user": optional}), is a lighter prompt tried once after a Groq 400 JSON generation
+    error or invalid output; the failed first attempt is traced as its own row."""
     t0 = time.monotonic()
     meta = {
         "agent": agent, "model": model, "fallback": True, "error": None, "latency_ms": 0.0, "attempts": 0,
-        "cached": False, "prompt_tokens": 0, "completion_tokens": 0,
+        "cached": False, "prompt_tokens": 0, "completion_tokens": 0, "retried_simple": False, "cache_key": None,
     }
     parsed = None
+    done = {"t": t0, "pt": 0, "ct": 0}
 
     def finish():
-        meta["latency_ms"] = (time.monotonic() - t0) * 1000
+        now = time.monotonic()
+        meta["latency_ms"] = (now - t0) * 1000
         meta["fallback"] = parsed is None
         if store is not None:
             try:
                 store.add_trace(
-                    agent, model, input_summary or user[:300],
+                    agent, model, (input_summary or user[:300]) + (" (simple retry)" if meta["retried_simple"] else ""),
                     parsed.model_dump_json() if parsed is not None else None,
-                    meta["latency_ms"], parsed is None, meta["error"],
-                    meta["prompt_tokens"] or None, meta["completion_tokens"] or None,
+                    (now - done["t"]) * 1000, parsed is None, meta["error"],
+                    (meta["prompt_tokens"] - done["pt"]) or None, (meta["completion_tokens"] - done["ct"]) or None,
                 )
             except Exception:
                 pass
         return parsed, meta
 
-    try:
-        cfg = load_config()
-        timeout_s = timeout_s or cfg.llm.timeout_s
-        effort = getattr(cfg.llm.reasoning_effort, agent, None)
-        max_tokens = getattr(cfg.llm.max_tokens, agent, None)
-        key = cache_key(model, effort, system, user, schema)
-        use_cache = cache and store is not None and cache_enabled()
-        if use_cache:
-            hit = store.cache_get(key, cfg.llm.cache_ttl_s)
-            if hit is not None:
-                try:
-                    parsed = schema.model_validate_json(hit)
-                    meta["cached"], meta["error"] = True, "cache"
-                    return finish()
-                except ValidationError:
-                    parsed = None
-        if store is not None and store.usage_today(model)["total_tokens"] >= cfg.llm.daily_token_budget:
-            meta["error"] = "daily token budget reached"
-            return finish()
-        chat = chat or get_chat(model, timeout_s, effort, max_tokens)
-        if chat is None:
-            meta["error"] = "no GROQ_API_KEY" if not os.environ.get("GROQ_API_KEY") else "client unavailable"
-            return finish()
-        bound = chat.bind(response_format={"type": "json_object"})
-        msgs = [("system", system), ("user", user)]
-        invalid_left, rate_left = 1, 1
+    def run(bound, msgs, invalid_left):
+        """One pass. Returns (parsed | None, retryable). Sets meta['error'] on failure."""
+        rate_left = 1
         while True:
             prompt_est = estimate_tokens(" ".join(m[1] for m in msgs))
             est = prompt_est + (max_tokens or 0)
             tpm = tpm_limiter(model)
             if not limiter().acquire(timeout_s):
                 meta["error"] = "rate limiter: bucket empty"
-                return finish()
+                return None, False
             if not tpm.acquire(timeout_s, est):
                 meta["error"] = "rate limiter: token bucket empty"
-                return finish()
+                return None, False
             meta["attempts"] += 1
             try:
                 resp = bound.invoke(msgs)
@@ -216,7 +206,7 @@ def call_structured(agent, model, schema: type[BaseModel], system, user, timeout
                 meta["error"] = "timeout" if _is_timeout(e) else f"{type(e).__name__}: {str(e)[:160]}"
                 if wait is not None:
                     meta["error"] = f"429 retry-after {wait:g}s too long" if wait != float("inf") else "429 rate limited"
-                return finish()
+                return None, is_json_gen_error(e)
             content = resp.content if isinstance(getattr(resp, "content", None), str) else str(getattr(resp, "content", resp))
             pt, ct = _usage(resp, prompt_est, content)
             tpm.adjust(min(est, tpm.capacity) - (pt + ct))
@@ -225,18 +215,61 @@ def call_structured(agent, model, schema: type[BaseModel], system, user, timeout
             if store is not None:
                 store.add_usage(model, 1, pt, ct)
             try:
-                parsed = schema.model_validate(json.loads(_extract_json(content)))
+                out = schema.model_validate(json.loads(_extract_json(content)))
                 meta["error"] = None
-                if use_cache:
-                    store.cache_put(key, model, parsed.model_dump_json())
-                return finish()
+                return out, False
             except (ValidationError, ValueError) as e:
                 meta["error"] = f"invalid output: {str(e)[:160]}"
                 if invalid_left:
                     invalid_left -= 1
                     msgs = msgs + [("assistant", content[:1500]), ("user", "That was invalid. Reply with only the JSON object in the required format.")]
                     continue
-                return finish()
+                return None, True
+
+    try:
+        cfg = load_config()
+        timeout_s = timeout_s or cfg.llm.timeout_s
+        effort = getattr(cfg.llm.reasoning_effort, agent, None)
+        max_tokens = getattr(cfg.llm.max_tokens, agent, None)
+        key = cache_key(model, effort, system, user, schema)
+        meta["cache_key"] = key
+        use_cache = cache and store is not None and cache_enabled()
+        if use_cache:
+            hit = store.cache_get(key, cfg.llm.cache_ttl_s)
+            if hit is not None:
+                try:
+                    parsed = schema.model_validate_json(hit)
+                    meta["cached"], meta["error"] = True, "cache"
+                    return finish()
+                except ValidationError:
+                    parsed = None
+        if store is not None and store.usage_today(model)["total_tokens"] >= cfg.llm.daily_token_budget:
+            meta["error"] = "daily token budget reached"
+            return finish()
+        supplied = chat is not None
+        chat = chat or get_chat(model, timeout_s, effort, max_tokens)
+        if chat is None:
+            meta["error"] = "no GROQ_API_KEY" if not os.environ.get("GROQ_API_KEY") else "client unavailable"
+            return finish()
+        fmt = {"type": "json_object"}
+        parsed, retryable = run(chat.bind(response_format=fmt), [("system", system), ("user", user)], 0 if simple else 1)
+        if parsed is None and retryable and simple:
+            now = time.monotonic()
+            if store is not None:
+                try:
+                    store.add_trace(
+                        agent, model, (input_summary or user[:300]) + " (attempt 1)", None, (now - t0) * 1000, True, meta["error"],
+                        meta["prompt_tokens"] or None, meta["completion_tokens"] or None,
+                    )
+                except Exception:
+                    pass
+            done.update(t=now, pt=meta["prompt_tokens"], ct=meta["completion_tokens"])
+            meta["retried_simple"] = True
+            chat2 = chat if supplied else (get_chat(model, timeout_s, "low", max_tokens) or chat)
+            parsed, _ = run(chat2.bind(response_format=fmt), [("system", simple["system"]), ("user", simple.get("user", user))], 1)
+        if parsed is not None and use_cache:
+            store.cache_put(key, model, parsed.model_dump_json())
+        return finish()
     except Exception as e:
         meta["error"] = f"{type(e).__name__}: {str(e)[:160]}"
         parsed = None

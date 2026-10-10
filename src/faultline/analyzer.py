@@ -6,12 +6,19 @@ from . import baseline as bl
 
 SPACES = {"\u202f": " ", "\u00a0": " "}
 HYPHENS = {"\u2013": "-", "\u2011": "-", "\u2012": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
+SYMBOLS = {
+    "\u2192": "->", "\u21d2": "=>", "\u2190": "<-", "\u2194": "<->", "\u2264": "<=", "\u2265": ">=", "\u2260": "!=",
+    "\u2248": "~", "\u00d7": "x", "\u2026": "...", "\u2022": "-", "\u00b7": "-", "\u2212": "-", "\u2009": " ", "\u200a": " ",
+    "\u2002": " ", "\u2003": " ", "\u201a": ",", "\u201e": '"', "\u2032": "'", "\u2033": '"', "\u00b1": "+/-", "\u200b": "",
+    "\u2713": "ok", "\u2714": "ok", "\u2717": "x", "\u2718": "x",
+}
 
 
 def clean(text: str) -> str:
-    """Plain ASCII punctuation: em dashes become ' - ', non-breaking hyphens and en dashes '-', odd spaces ' '."""
+    """Plain ASCII punctuation: em dashes become ' - ', non-breaking hyphens and en dashes '-', arrows and other common symbols
+    their ASCII spelling, odd spaces ' '."""
     text = re.sub(r"[ \t]*[\u2014\u2015][ \t]*", " - ", text)
-    for k, v in {**SPACES, **HYPHENS}.items():
+    for k, v in {**SPACES, **HYPHENS, **SYMBOLS}.items():
         text = text.replace(k, v)
     return text
 
@@ -81,8 +88,18 @@ def verdict(predicted: set[str], actual: set[str]) -> str:
     return "PARTIAL" if predicted & actual else "REFUTED"
 
 
-def recovery_norm(cfg, injected: bool, reverted: bool, recovery_s: float | None) -> tuple[float, bool]:
-    if not injected or not reverted:
+def recovery_measured(exp: dict) -> bool:
+    """False when an operator stop ended the experiment before recovery could be measured. Rows written before the
+    recovery_measured column existed are judged by their abort source."""
+    flag = exp.get("recovery_measured")
+    if flag is not None:
+        return bool(flag)
+    return not (exp.get("recovery_seconds") is None and exp.get("abort_source") == "operator")
+
+
+def recovery_norm(cfg, injected: bool, reverted: bool, recovery_s: float | None, measured: bool = True) -> tuple[float, bool]:
+    """(component 0..1, never recovered). An unmeasured recovery contributes 0 and is never reported as never recovered."""
+    if not injected or not reverted or not measured:
         return 0.0, False
     if recovery_s is None:
         return 1.0, True
@@ -112,7 +129,8 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
     total = len(impact_map) or len(graph.get("journeys") or {}) or 1
     impact = max(deg.values(), default=0.0)
     breadth = len(affected) / total
-    rec, never = recovery_norm(cfg, injected, exp.get("reverted_at") is not None, exp.get("recovery_seconds"))
+    measured = recovery_measured(exp)
+    rec, never = recovery_norm(cfg, injected, exp.get("reverted_at") is not None, exp.get("recovery_seconds"), measured)
     pen = penalty(cfg, impact, breadth, rec) if injected else 0.0
     hidden = sorted(j for j in affected if j not in pred | mapped and deg[j] >= cfg.score.hidden_min_impact)
     return {
@@ -125,7 +143,7 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
         "outcome": exp["state"], "abort_reason": exp.get("abort_reason"), "injected": injected,
         "degradation": {j: round(d, 3) for j, d in deg.items()}, "affected_journeys": affected,
         "impact": round(impact, 3), "breadth": round(breadth, 3), "recovery_s": exp.get("recovery_seconds"),
-        "recovery_norm": round(rec, 3), "never_recovered": never, "penalty": round(pen, 1),
+        "recovery_norm": round(rec, 3), "never_recovered": never, "recovery_measured": measured or not injected, "penalty": round(pen, 1),
         "verdict": verdict(pred, set(affected)) if injected else "n/a",
         "hidden_journeys": hidden,
         "abort_source": exp.get("abort_source"), "safety_decisions": exp.get("safety_decisions") or [],
@@ -213,5 +231,6 @@ def formula_text(cfg) -> str:
     return (
         f"penalty = 100 x ({s.impact_weight} x impact + {s.breadth_weight} x breadth + {s.recovery_weight} x recovery); "
         f"service score = 100 - worst penalty on that service; overall = mean of service scores weighted by the number of "
-        f"journeys the service sits on (at least 1; the larger of the map's count and the journeys it was seen to degrade)."
+        f"journeys the service sits on (at least 1; the larger of the map's count and the journeys it was seen to degrade). "
+        f"An experiment whose recovery was not measured (operator stop) contributes no recovery component."
     )

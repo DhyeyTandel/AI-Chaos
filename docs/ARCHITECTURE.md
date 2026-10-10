@@ -82,7 +82,7 @@ flowchart TD
 
 Budget control: a shared request limiter, a per-model token bucket (8000 tokens/min), a per-model daily budget (180,000 tokens), and a 6 h response cache. `agents usage` and `agents trace` expose all of it.
 
-**Resilience score.** Per experiment, penalty = 100 x (0.5 x impact + 0.3 x breadth + 0.2 x recovery). A service scores 100 minus its worst penalty. The overall score is the mean of service scores weighted by the number of journeys the service sits on. Weights and caps are in `[score]`.
+**Resilience score.** Per experiment, penalty = 100 x (0.5 x impact + 0.3 x breadth + 0.2 x recovery). A service scores 100 minus its worst penalty. The overall score is the mean of service scores weighted by the number of journeys the service sits on. Weights and caps are in `[score]`. A recovery that was not measured (operator stop) contributes 0 and is noted in the report; the analyst drops recovery weaknesses whose recoveries are at or below `recovery_floor_s`.
 
 ## Safety controls
 
