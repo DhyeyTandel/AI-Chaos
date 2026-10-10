@@ -145,8 +145,10 @@ async def run_probe(store, seconds: float, interval: float = 1.0, timeout: float
                     break
                 except asyncio.TimeoutError:
                     pass
-            for s in await prober.tick():
-                store.insert_sample(s.ts_wall, s.ts_mono, s.journey, s.ok, s.status, s.latency_ms, s.error)
+            samples = await prober.tick()
+            store.insert_many(
+                [(s.ts_wall, s.ts_mono, s.journey, s.ok, s.status, s.latency_ms, s.error) for s in samples]
+            )
             now = time.monotonic()
             nxt += interval
             if nxt <= now:

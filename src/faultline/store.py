@@ -29,13 +29,17 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
 
     def insert_sample(self, ts_wall, ts_mono, journey, ok, status, latency_ms, error=None):
-        self.conn.execute(
+        self.insert_many([(ts_wall, ts_mono, journey, ok, status, latency_ms, error)])
+
+    def insert_many(self, rows):
+        self.conn.executemany(
             "INSERT INTO probe_samples (ts_wall, ts_mono, journey, ok, status, latency_ms, error)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ts_wall, ts_mono, journey, int(bool(ok)), status, latency_ms, error),
+            [(w, m, j, int(bool(o)), st, lat, e) for w, m, j, o, st, lat, e in rows],
         )
         self.conn.commit()
 

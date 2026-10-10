@@ -1,0 +1,49 @@
+# The demo's 20M limits on these two Go services cause page-cache thrash and hung
+# requests on a 4 CPU / 16 GB Codespace. Raised here without touching vendor/.
+services:
+  product-catalog:
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+  checkout:
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # OpenSearch and Grafana are not used by faultline (it reads Prometheus and Jaeger)
+  # and add IO load. Disabled via an opt-in profile; dependencies on them are dropped.
+  opensearch:
+    profiles: ["full-observability"]
+  grafana:
+    profiles: ["full-observability"]
+  frontend-proxy:
+    depends_on: !override
+      frontend:
+        condition: service_healthy
+      load-generator:
+        condition: service_started
+      flagd-ui:
+        condition: service_healthy
+      telemetry-docs:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+      opamp-server:
+        condition: service_healthy
+  otel-collector:
+    command: !override
+      - "--config=/etc/otelcol-config.yml"
+      - "--config=/etc/otelcol-config-full.yml"
+      - "--config=/etc/otelcol-config-observability.yml"
+      - "--config=/etc/otelcol-config-extras.yml"
+      - "--config=/etc/otelcol-config-trim.yml"
+      - "--feature-gates=service.profilesSupport"
+    volumes:
+      - ./config/otelcol-trim.yml:/etc/otelcol-config-trim.yml
+    depends_on: !override
+      jaeger:
+        condition: service_started
+      opamp-server:
+        condition: service_healthy
