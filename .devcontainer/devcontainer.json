@@ -2,7 +2,10 @@
   "name": "AI-Chaos",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false }
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    },
+    "ghcr.io/devcontainers/features/sshd:1": {}
   },
   "hostRequirements": {
     "cpus": 4,
@@ -10,9 +13,14 @@
     "storage": "32gb"
   },
   "postCreateCommand": "git submodule update --init --recursive && pip install -e '.[dev]'",
-  "forwardPorts": [8080],
+  "forwardPorts": [
+    8080
+  ],
   "portsAttributes": {
-    "8080": { "label": "Astronomy Shop", "onAutoForward": "notify" }
+    "8080": {
+      "label": "Astronomy Shop",
+      "onAutoForward": "notify"
+    }
   },
   "secrets": {
     "GROQ_API_KEY": {
