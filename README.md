@@ -164,6 +164,7 @@ Token budget handling: a per-model limiter (8000 tokens/min), a daily budget per
 From live runs on an 8-core Linux host (see `reports/sample/` for the full report of run-201605-9bf7, 4 rounds, all four agents on Groq):
 
 - **The sample run.** Round 1: a 50 ms delay on flagd was aborted by the Safety agent ("product p95 221 ms > baseline 132 ms, outside predicted blast radius") before any threshold was breached. Rounds 2 and 3: 50 ms delays on frontend-proxy and cart completed, so the ladder climbed to tier 2. Round 4: a 300 ms delay on valkey-cart was aborted by the watchdog at cart p95 2156 ms. Every fault was reverted; recovery took about 5 s each.
+- **Second sample.** `reports/sample-2/` (run-202432-9c92, score 44.6): the Safety review vetoed 10 % loss on product-catalog before injection, then the watchdog aborted a 50 ms delay on product-catalog at product p95 1023 ms.
 - **Hidden dependency.** flagd (feature flags) is on no journey in the map, yet a crash pushed cart p95 to about 3 s and even a 50 ms delay slowed the product page. It is the most repeated finding across runs.
 - **Latency without errors.** 10 % packet loss on currency raised checkout p95 from 74 ms to 410 ms with zero errors.
 - **Traffic spike.** 100 Locust users raised checkout p95 from 37 ms to 163 ms; the spike was reverted by the experiment, and separately by the kill switch in a test.
