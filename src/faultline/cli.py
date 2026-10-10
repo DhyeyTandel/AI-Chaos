@@ -11,6 +11,7 @@ from rich.table import Table
 from . import baseline as bl
 from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer, runs as runs_mod
 from .agents import planner as planner_mod
+from .agents import safety as safety_mod
 from . import reaper as reaper_mod
 from .config import load_config
 from .injector import Injector
@@ -213,6 +214,11 @@ def _baseline_run(store, cfg, seconds, warmup) -> dict:
     return b
 
 
+def _safety_line(e: dict) -> str:
+    line = f"safety agent: {safety_mod.describe(e['safety_decisions'])}"
+    return line + (f"; aborted by {e['abort_source']}" if e["state"] == "ABORTED" and e["abort_source"] else "")
+
+
 def _print_experiment(e: dict):
     t = Table("id", "fault", "target", "state", "recovery s", "abort reason")
     rec = e["recovery_seconds"]
@@ -223,6 +229,7 @@ def _print_experiment(e: dict):
         style="red" if e["state"] == "ABORTED" else "green",
     )
     console.print(t)
+    console.print(_safety_line(e), markup=False, highlight=False)
     if e["impact"]:
         it = Table("journey", "n", "err % (fault)", "err % (base)", "p95 ms (fault)", "p95 ms (base)")
         for j, v in e["impact"].items():
@@ -234,18 +241,24 @@ def _print_experiment(e: dict):
         console.print(it)
 
 
-def _run_experiment(store, cfg, fault, target, duration, params) -> dict:
+def _revert_own(store, driver, cfg):
+    inj = Injector(Ledger(store), driver, cfg)
+    for exp_id in sorted(exp_mod.OWN):
+        inj.revert_experiment(exp_id)
+
+
+def _run_experiment(store, cfg, fault, target, duration, params, context=None) -> dict:
     driver = faults.DockerDriver()
     try:
         return asyncio.run(
-            exp_mod.run_experiment(store, driver, cfg, fault, target, duration, params, log=lambda m: console.print(m, markup=False, highlight=False))
+            exp_mod.run_experiment(store, driver, cfg, fault, target, duration, params, log=lambda m: console.print(m, markup=False, highlight=False), context=context)
         )
     except faults.ValidationError as e:
         console.print(f"rejected: {e}", markup=False)
         raise typer.Exit(2)
     except KeyboardInterrupt:
         console.print("interrupted; reverting", markup=False)
-        Injector(Ledger(store), driver, cfg).revert_all()
+        _revert_own(store, driver, cfg)
         raise typer.Exit(1)
 
 
@@ -261,7 +274,13 @@ def experiment(
     """Run one guarded fault injection with watchdog, revert, and recovery measurement."""
     cfg = load_config()
     store = Store()
-    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct})
+    context = None
+    try:
+        gmap = planner_mod.load_map(cfg, os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml"), _data_dir() / "map.json")
+        context = safety_mod.context_from_map(gmap, target)
+    except Exception:
+        pass
+    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct}, context)
     _print_experiment(e)
     raise typer.Exit(0 if e["state"] == "COMPLETED" else 1)
 
@@ -442,15 +461,15 @@ def run_cmd(
     with runs_mod.RunControl() as control:
         control.install_signals()
 
-        def runner(c):
+        def runner(c, context=None):
             try:
                 return asyncio.run(exp_mod.run_experiment(
                     store, driver, cfg, c.fault, c.target, c.duration_s, dict(c.params),
-                    log=lambda m: console.print(m, markup=False, highlight=False),
+                    log=lambda m: console.print(m, markup=False, highlight=False), context=context,
                 ))
             except KeyboardInterrupt:
                 console.print("interrupted; reverting", markup=False)
-                Injector(Ledger(store), driver, cfg).revert_all()
+                _revert_own(store, driver, cfg)
                 control.request("operator interrupt (Ctrl+C)")
                 return None
             finally:
@@ -462,7 +481,7 @@ def run_cmd(
                 log=lambda m: console.print(m, markup=False, highlight=False), on_round=lambda r: _print_round(r, rounds),
             )
         except KeyboardInterrupt:
-            Injector(Ledger(store), driver, cfg).revert_all()
+            _revert_own(store, driver, cfg)
             run = runs_mod.get(store)
     console.print()
     _print_run(run, runs_mod.rounds(store, run["run_id"]))
@@ -521,6 +540,12 @@ def runs_show(run_id: str = typer.Argument(None, help="Run id (default: latest)"
             + (f"; abort: {r['abort_reason']}" if r["abort_reason"] else ""),
             markup=False, highlight=False,
         )
+        if r["experiment_id"]:
+            e = exp_mod.get(store, r["experiment_id"])
+            console.print("  " + _safety_line(e), markup=False, highlight=False)
+            for c in e["safety_decisions"]:
+                what = f"{c['decision']} ({c['concern']}) {c['reason']}" if c["decision"] else f"ignored ({c['error']})"
+                console.print(f"    t={c['t']:g}s {what} [{c['latency_ms']} ms, {c['tokens']} tok]", markup=False, highlight=False)
 
 
 @agents_app.command("trace")

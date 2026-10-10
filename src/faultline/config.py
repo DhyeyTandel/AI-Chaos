@@ -31,6 +31,7 @@ DEFAULTS = {
         "crash_exclude": ["frontend-proxy"],
         "expiry_margin_s": 5,
     },
+    "safety_agent": {"enabled": True, "interval_s": 10, "first_check_s": 5, "timeout_s": 8},
     "reaper": {"interval_s": 2.0, "stale_s": 10, "heartbeat_s": 1.0},
     "map": {"lookback_min": 60},
     "llm": {

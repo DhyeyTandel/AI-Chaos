@@ -128,6 +128,7 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
         "recovery_norm": round(rec, 3), "never_recovered": never, "penalty": round(pen, 1),
         "verdict": verdict(pred, set(affected)) if injected else "n/a",
         "hidden_journeys": hidden,
+        "abort_source": exp.get("abort_source"), "safety_decisions": exp.get("safety_decisions") or [],
     }
 
 
@@ -138,6 +139,7 @@ def load_experiments(store, run_id: str, rounds: list[dict], until: float | None
             r = dict(r)
             r["params"] = json.loads(r["params"])
             r["impact"] = json.loads(r["impact"]) if r["impact"] else None
+            r["safety_decisions"] = json.loads(r["safety_decisions"]) if r.get("safety_decisions") else []
             out.append(r)
         return out
 

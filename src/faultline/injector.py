@@ -48,11 +48,20 @@ class Injector:
         return REVERTED if err is None else REVERT_FAILED
 
     def revert_all(self, wait_s: float = 30.0) -> dict[int, str]:
+        """Global revert: kill switch and reaper only. An experiment must use revert_experiment."""
+        return self._revert_open(wait_s, None)
+
+    def revert_experiment(self, experiment_id: str, wait_s: float = 30.0) -> dict[int, str]:
+        return self._revert_open(wait_s, experiment_id)
+
+    def _revert_open(self, wait_s: float, experiment_id: str | None) -> dict[int, str]:
         results: dict[int, str] = {}
         deadline = time.time() + wait_s
         while True:
             busy = False
             for e in self.ledger.open_entries():
+                if experiment_id is not None and e["experiment_id"] != experiment_id:
+                    continue
                 if e["id"] in results:
                     continue
                 state = self.revert(e["id"])

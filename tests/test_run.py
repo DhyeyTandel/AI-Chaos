@@ -22,7 +22,7 @@ class Script:
         self.calls = []
         self.n = 0
 
-    def __call__(self, c):
+    def __call__(self, c, context=None):
         self.calls.append(c)
         self.n += 1
         state, reason = self.outcomes.get(self.n, ("COMPLETED", None))
@@ -105,7 +105,7 @@ def test_kill_switch_ends_whole_run(rcfg, store, tmp_path):
     sentinel = tmp_path / "STOP"
     control = runs.RunControl(path=sentinel)
 
-    def runner(c):
+    def runner(c, context=None):
         sentinel.write_text("1")
         return {"id": "exp-x", "state": "ABORTED", "abort_reason": "kill switch (STOP file)", "recovery_seconds": None}
 

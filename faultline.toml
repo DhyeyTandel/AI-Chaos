@@ -44,6 +44,12 @@ allow = [
 crash_exclude = ["frontend-proxy"]   # allowed for delay, refused for crash
 expiry_margin_s = 5       # ledger expires_at = apply time + duration + margin
 
+[safety_agent]
+enabled = true            # advisory LLM check during OBSERVING; it can only abort earlier, never override the watchdog
+interval_s = 10           # period between checks
+first_check_s = 5         # first check this long after injection
+timeout_s = 8             # a check slower than this is ignored (watchdog verdict stands)
+
 [reaper]
 interval_s = 2.0          # reaper loop period
 stale_s = 10              # controller heartbeat older than this means revert everything

@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from . import analyzer
+from .agents import safety
 
 MARKER_INPUTS = ("ranking validation", "weakness validation", "fix validation")
 AGENTS = ("planner", "safety", "analyst", "fixer")
@@ -64,7 +65,7 @@ def ai_usage(store, run: dict, since: float, results: dict) -> list[dict]:
 def methodology_text(cfg) -> list[str]:
     return [
         "An independent synthetic prober exercises four user journeys (home, product, cart, checkout) through the front proxy every second. It is the ground truth and does not depend on the application's own telemetry.",
-        "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober.",
+        "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober. An advisory safety agent re-checks the live measurements every few seconds and may abort earlier; it can never cancel a watchdog abort, extend a fault or change a threshold.",
         "Each experiment injects one fault (container crash, added network delay or packet loss), measures every journey during the fault window (up to the abort for aborted runs), reverts the fault, and measures how long the journeys take to return inside the baseline band.",
         "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
         f"A hidden dependency is a journey that degraded by at least {cfg.score.hidden_min_impact} although neither the hypothesis nor the dependency map expected it.",
@@ -138,10 +139,10 @@ def blocks(cfg, d: dict) -> list:
     hist = [a for a in d["experiments"] if a["scope"] == "history"]
     b.append(("h", 2, "Experiments in this run", ""))
     cut = lambda s, n: (s or "-") if len(s or "") <= n else s[: n - 3] + "..."
-    b.append(("table", ["Round", "Tier", "Fault", "Target", "AI reason", "Hypothesis", "Verdict", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Outcome"],
+    b.append(("table", ["Round", "Tier", "Fault", "Target", "AI reason", "Hypothesis", "Verdict", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Safety agent", "Outcome"],
               [[a["round"], a["tier"], a["label"], a["target"], cut(a["reason"], 140), cut(a["hypothesis"], 140), a["verdict"],
-                ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}",
-                a["outcome"] + (f" ({cut(a['abort_reason'], 60)})" if a["abort_reason"] else "")] for a in run_exps]))
+                ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", safety.describe(a["safety_decisions"]),
+                a["outcome"] + (f" by {a['abort_source']}" if a["abort_source"] else "") + (f" ({cut(a['abort_reason'], 60)})" if a["abort_reason"] else "")] for a in run_exps]))
     if hist:
         b.append(("h", 2, "Earlier experiments in the database", ""))
         b.append(("p", "These ran before this run and count toward service scores and hidden dependency findings."))
@@ -163,9 +164,23 @@ def blocks(cfg, d: dict) -> list:
     b.append(("h", 2, "AI usage", ""))
     b.append(("table", ["Agent", "Path", "Groq calls", "Fallbacks", "Cached", "Prompt tokens", "Completion tokens"],
               [[u["agent"], u["path"], u["groq_calls"], u["fallbacks"], u["cached"], u["prompt_tokens"], u["completion_tokens"]] for u in d["ai_usage"]]))
+    b.append(("p", safety_summary(run_exps)))
     n = d["notes"]
     b.append(("p", f"Analyst weaknesses dropped by validation: {n['analyst_dropped']}. Fixes filled by the rule-based catalog: {n['fixer_filled_by_fallback']}."))
     return b
+
+
+def safety_summary(exps: list[dict]) -> str:
+    checks = [c for a in exps for c in a["safety_decisions"]]
+    if not checks:
+        return "Safety agent: no checks recorded in this run (disabled, no key, or no experiment reached observation)."
+    s = safety.summarize(checks)
+    by = lambda src: sum(1 for a in exps if a["outcome"] == "ABORTED" and a["abort_source"] == src)
+    return (
+        f"Safety agent: {s['checks']} checks across {sum(1 for a in exps if a['safety_decisions'])} experiments "
+        f"(continue {s['continue']}, abort {s['abort']}, ignored {s['ignored']}). Aborts by watchdog: {by('watchdog')}, "
+        f"by safety agent: {by('safety_agent')}. Ignored checks (timeout, rate limit, invalid output or budget) leave the watchdog verdict standing."
+    )
 
 
 def md_cell(v) -> str:

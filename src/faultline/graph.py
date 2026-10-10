@@ -4,7 +4,7 @@ from typing import TypedDict
 from langgraph.graph import END, StateGraph
 
 from . import analyzer, faults, report, runs
-from .agents import analyst, fixer, planner, validator
+from .agents import analyst, fixer, planner, safety, validator
 
 
 class PlanState(TypedDict, total=False):
@@ -126,9 +126,10 @@ def build_run_graph(cfg, graph_map: dict, store, runner, settler, control, chat=
         if why:
             return {"stop_reason": why, "experiment": None}
         c = state["selected"].candidate
+        hyp, blast = planner.hypothesis_for(state["plan"], graph_map, state["selected"])
         log(f"round {state['round']}/{state['rounds']}: running {c.id}")
         try:
-            exp = runner(c)
+            exp = runner(c, safety.context_from_map(graph_map, c.target, hyp, blast))
         except faults.ValidationError as e:
             return {"stop_reason": f"experiment rejected: {e}", "experiment": None}
         if exp is None:

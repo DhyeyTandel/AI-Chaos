@@ -143,7 +143,7 @@ def _is_timeout(e: Exception) -> bool:
     return "timeout" in type(e).__name__.lower()
 
 
-def call_structured(agent, model, schema: type[BaseModel], system, user, timeout_s=None, store=None, input_summary=None, chat=None):
+def call_structured(agent, model, schema: type[BaseModel], system, user, timeout_s=None, store=None, input_summary=None, chat=None, cache=True):
     """Returns (parsed | None, meta). Never raises. Every call is written to agent_trace when a store is given."""
     t0 = time.monotonic()
     meta = {
@@ -173,7 +173,7 @@ def call_structured(agent, model, schema: type[BaseModel], system, user, timeout
         effort = getattr(cfg.llm.reasoning_effort, agent, None)
         max_tokens = getattr(cfg.llm.max_tokens, agent, None)
         key = cache_key(model, effort, system, user, schema)
-        use_cache = store is not None and cache_enabled()
+        use_cache = cache and store is not None and cache_enabled()
         if use_cache:
             hit = store.cache_get(key, cfg.llm.cache_ttl_s)
             if hit is not None:

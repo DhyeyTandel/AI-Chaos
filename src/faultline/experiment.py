@@ -9,10 +9,12 @@ from . import baseline as bl
 from . import faults, watchdog
 from .injector import Injector
 from .ledger import REVERTED, Ledger
+from .agents import safety
 from .prober import run_probe
 from .store import Store, default_db_path
 
 STOP_NAME = "STOP"
+OWN: set[str] = set()
 
 
 def stop_path() -> Path:
@@ -41,10 +43,11 @@ def get(store, exp_id) -> dict:
     r = dict(store.conn.execute("SELECT * FROM experiments WHERE id = ?", (exp_id,)).fetchone())
     r["params"] = json.loads(r["params"])
     r["impact"] = json.loads(r["impact"]) if r["impact"] else None
+    r["safety_decisions"] = json.loads(r["safety_decisions"]) if r["safety_decisions"] else []
     return r
 
 
-async def run_experiment(store, driver, cfg, fault, target, duration, params=None, log=print, stop: asyncio.Event | None = None):
+async def run_experiment(store, driver, cfg, fault, target, duration, params=None, log=print, stop: asyncio.Event | None = None, context=None, chat=None):
     params = faults.validate(cfg, fault, target, duration, params or {})
     base = bl.latest(store)
     if base is None:
@@ -54,6 +57,7 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
     db_path = store.path
     ledger = Ledger(store)
     exp_id = new_id()
+    OWN.add(exp_id)
     with store.conn:
         store.conn.execute(
             "INSERT INTO experiments (id, fault, target, params, state, created_at) VALUES (?, ?, ?, ?, 'PREFLIGHT', ?)",
@@ -86,6 +90,8 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
     )
     beat_task = asyncio.create_task(beat())
     state, reason, recovery = "ABORTED", None, None
+    source = None
+    monitor = None
     t_inject = t_revert = None
     entry_id = None
     try:
@@ -96,6 +102,7 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
         orphans = await asyncio.to_thread(driver.list_owned)
         if entries or orphans:
             reason = f"preflight: {entries} open ledger entries, {len(orphans)} faultline containers"
+            source = "preflight"
         else:
             while time.time() - t_pre < cfg.preflight.probe_s and not stop.is_set():
                 await asyncio.sleep(0.5)
@@ -104,9 +111,10 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
                 rows_since(now - 60), thresholds, now, cfg.preflight.probe_s, cfg.watchdog.min_samples
             )
             if stop.is_set() or sp.exists():
-                reason = "operator stop during preflight"
+                reason, source = "operator stop during preflight", "operator"
             elif breaches or short:
                 reason = "preflight: " + ("; ".join(breaches) or f"insufficient samples for {', '.join(short)}")
+                source = "preflight"
         if reason is None:
             _update(store, exp_id, state="INJECTING")
             log(f"[{exp_id}] INJECTING {fault} on {target} for {duration}s")
@@ -115,30 +123,36 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
                     lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject(exp_id, fault, target, params, duration))
                 )
             except Exception as e:
-                reason = f"inject failed: {type(e).__name__}: {e}"
+                reason, source = f"inject failed: {type(e).__name__}: {e}", "inject"
         if reason is None:
             t_inject = time.time()
             _update(store, exp_id, state="OBSERVING", injected_at=t_inject)
             log(f"[{exp_id}] OBSERVING")
             wd = watchdog.Watchdog(thresholds, cfg, t_inject)
+            monitor = safety.Monitor(cfg, db_path, base, fault, target, params, duration, context, t_inject, chat=chat, log=lambda m: log(f"[{exp_id}] {m}"))
+            monitor.start()
             while time.time() - t_inject < duration:
                 await asyncio.sleep(cfg.watchdog.interval_s)
                 now = time.time()
                 if stop.is_set():
-                    reason = "operator interrupt (Ctrl+C / signal)"
+                    reason, source = "operator interrupt (Ctrl+C / signal)", "operator"
                 elif sp.exists():
-                    reason = "kill switch (STOP file)"
+                    reason, source = "kill switch (STOP file)", "operator"
                 else:
                     d = wd.check(rows_since(now - cfg.watchdog.window_s - 15), now)
                     if d.status != watchdog.OK:
-                        reason = f"watchdog {d.status}: {d.reason}"
+                        reason, source = f"watchdog {d.status}: {d.reason}", "watchdog"
+                    elif monitor.abort_reason():
+                        reason, source = f"safety agent: {monitor.abort_reason()}", "safety_agent"
                 if reason:
                     log(f"[{exp_id}] ABORT: {reason}")
                     break
+        if monitor:
+            monitor.stop()
         if t_inject is not None:
             _update(store, exp_id, state="REVERTING")
             log(f"[{exp_id}] REVERTING")
-        results = await asyncio.to_thread(lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.revert_all()))
+        results = await asyncio.to_thread(lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.revert_experiment(exp_id)))
         t_revert = time.time() if t_inject is not None else None
         bad = {i: st for i, st in results.items() if st != REVERTED}
         if bad:
@@ -159,15 +173,23 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
         for sig in installed:
             loop.remove_signal_handler(sig)
         await asyncio.gather(probe_task, beat_task, return_exceptions=True)
-        await asyncio.to_thread(lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.revert_all(wait_s=5)))
+        await asyncio.to_thread(lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.revert_experiment(exp_id, wait_s=5)))
+        if monitor:
+            monitor.stop()
+            await asyncio.to_thread(monitor.join, cfg.safety_agent.timeout_s + 2)
         if state == "ABORTED" and reason is None:
-            reason = "unexpected error"
+            reason, source = "unexpected error", "system"
+        if source is None and reason:
+            source = "revert"
+        checks = monitor.snapshot() if monitor else []
         impact = None
         if t_inject is not None:
             impact = watchdog.impact(store.query(since=t_inject - 20), base, t_inject, t_revert or time.time())
         _update(
             store, exp_id, state=state, abort_reason=reason, recovery_seconds=recovery,
             finished_at=time.time(), impact=json.dumps(impact) if impact else None,
+            abort_source=source if state == "ABORTED" else None, safety_checks=len(checks),
+            safety_decisions=json.dumps(checks) if checks else None,
         )
     return get(store, exp_id)
 

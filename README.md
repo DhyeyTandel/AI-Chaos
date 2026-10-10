@@ -100,7 +100,7 @@ Faults are never applied without these layers in place. Each is independent of t
 | Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 % |
 | Write-ahead ledger | The fault is recorded in SQLite before it is applied, so anything left over can be found and reverted |
 | Watchdog | Every 1 s, judges each journey against thresholds derived from the baseline (error rate and p95, with floors in `faultline.toml`); aborts on breach, or if no samples arrive for 5 s |
-| Safety agent (in progress) | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
+| Safety agent | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
 | Reaper | Separate always-on container; reverts faults past expiry, or all faults if the controller heartbeat is older than 10 s (measured live: 13 s) |
 | Self-expiring netem sidecar | The network fault removes its own rule when its TTL ends (verified with both controller and reaper stopped) |
@@ -153,7 +153,7 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Planner, validator, risk ladder, autonomous run | Done |
 | Analyst, fixer, resilience score, Markdown/HTML/JSON report | Done |
 | Token budget, cache, agent trace | Done |
-| Safety agent (live advisory) | In progress |
+| Safety agent (live advisory) | Done (gpt-oss-20b, verified live) |
 | Auto-apply of proposed fixes | Future |
 | Dashboard | Future |
 | Combined (multi-fault) failures | Future |

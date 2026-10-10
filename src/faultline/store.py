@@ -58,7 +58,10 @@ CREATE TABLE IF NOT EXISTS experiments (
     finished_at REAL,
     abort_reason TEXT,
     recovery_seconds REAL,
-    impact TEXT
+    impact TEXT,
+    abort_source TEXT,
+    safety_checks INTEGER NOT NULL DEFAULT 0,
+    safety_decisions TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_trace (
@@ -123,7 +126,10 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 );
 """
 
-TRACE_MIGRATIONS = {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"}
+MIGRATIONS = {
+    "agent_trace": {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"},
+    "experiments": {"abort_source": "TEXT", "safety_checks": "INTEGER NOT NULL DEFAULT 0", "safety_decisions": "TEXT"},
+}
 
 
 def today() -> str:
@@ -147,13 +153,14 @@ class Store:
         self._migrate()
 
     def _migrate(self):
-        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(agent_trace)")}
-        for col, typ in TRACE_MIGRATIONS.items():
-            if col not in have:
-                try:
-                    self.conn.execute(f"ALTER TABLE agent_trace ADD COLUMN {col} {typ}")
-                except sqlite3.OperationalError:
-                    pass
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for col, typ in cols.items():
+                if col not in have:
+                    try:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                    except sqlite3.OperationalError:
+                        pass
         self.conn.commit()
 
     def insert_sample(self, ts_wall, ts_mono, journey, ok, status, latency_ms, error=None):
