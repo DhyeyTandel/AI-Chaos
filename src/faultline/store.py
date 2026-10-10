@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 SCHEMA = """
@@ -59,6 +60,18 @@ CREATE TABLE IF NOT EXISTS experiments (
     recovery_seconds REAL,
     impact TEXT
 );
+
+CREATE TABLE IF NOT EXISTS agent_trace (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    model TEXT,
+    input_summary TEXT,
+    output_json TEXT,
+    latency_ms REAL,
+    fallback INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
 """
 
 
@@ -102,6 +115,21 @@ class Store:
             args.append(until)
         sql += " ORDER BY ts_wall, id"
         return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def add_trace(self, agent, model, input_summary, output_json, latency_ms, fallback, error=None):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO agent_trace (ts, agent, model, input_summary, output_json, latency_ms, fallback, error)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (time.time(), agent, model, input_summary, output_json, latency_ms, int(bool(fallback)), error),
+                )
+        except sqlite3.Error:
+            pass
+
+    def traces(self, limit: int = 20):
+        rows = self.conn.execute("SELECT * FROM agent_trace ORDER BY id DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows][::-1]
 
     def close(self):
         self.conn.close()

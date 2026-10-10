@@ -9,7 +9,8 @@ from rich.console import Console
 from rich.table import Table
 
 from . import baseline as bl
-from . import docker_api, experiment as exp_mod, faults, mapper, observer
+from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer
+from .agents import planner as planner_mod
 from . import reaper as reaper_mod
 from .config import load_config
 from .injector import Injector
@@ -19,6 +20,8 @@ from .stats import journey_stats
 from .store import Store, default_db_path
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+agents_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Agent tools.")
+app.add_typer(agents_app, name="agents")
 console = Console()
 
 DEMO_SAFE = ("quote", "delay", 150)
@@ -347,3 +350,53 @@ def demo(day1: bool = typer.Option(False, "--day1", help="Run the Day 1 end-to-e
     result = e1["state"] == "COMPLETED" and e2["state"] == "ABORTED" and ok
     console.print(f"demo {'PASSED' if result else 'FAILED'}", markup=False)
     raise typer.Exit(0 if result else 1)
+
+
+@app.command()
+def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked and sent to the LLM")):
+    """Rank fault experiments (deterministic score + Groq) and validate the pick."""
+    cfg = load_config()
+    store = Store()
+    overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
+    gmap = planner_mod.load_map(cfg, overrides, _data_dir() / "map.json")
+    state = plan_graph.run_plan(cfg, gmap, store, top)
+    res = state["plan"]
+    t = Table("rank", "candidate", "target", "fault", "params", "det_score", "llm_rank", "reason")
+    t.columns[7].overflow = "fold"
+    for i, s in enumerate(res.ranked, 1):
+        c = s.candidate
+        params = ",".join(f"{k}={v:g}" for k, v in c.params.items() if v) or "-"
+        t.add_row(str(i), c.id, c.target, c.fault, f"{params} {c.duration_s}s", f"{s.det_score:.2f}", str(s.llm_rank or "-"), s.reason)
+    console.print(t)
+    pick = state.get("selected")
+    for r in state.get("rejected", []):
+        console.print(f"validator rejected {r['candidate']}: {r['reason']}", markup=False)
+    if pick:
+        hyp, blast = planner_mod.hypothesis_for(res, gmap, pick)
+        c = pick.candidate
+        console.print(f"selected: {c.fault} {c.target} {c.params or ''} {c.duration_s}s ({c.id})", markup=False)
+        console.print(f"hypothesis: {hyp}", markup=False)
+        console.print(f"predicted blast radius: {', '.join(blast) or 'none'}", markup=False)
+        console.print(f"validator: ok ({state['validation'][1]})", markup=False)
+    else:
+        console.print(f"no plan: validator: {state['validation'][1] if state.get('validation') else 'no candidates'}", markup=False)
+    if res.fallback:
+        console.print(f"planner: FALLBACK ({res.fallback_reason})", markup=False)
+    else:
+        console.print(f"planner: groq {res.model} ({res.latency_ms:.0f} ms)", markup=False)
+    raise typer.Exit(0 if pick else 1)
+
+
+@agents_app.command("trace")
+def agents_trace(limit: int = typer.Option(20, "--limit", "-n")):
+    """Show recent agent trace rows."""
+    t = Table("id", "time", "agent", "model", "ms", "fb", "input", "output", "error")
+    for col in (6, 7, 8):
+        t.columns[col].overflow = "fold"
+    for r in Store().traces(limit):
+        t.add_row(
+            str(r["id"]), time.strftime("%H:%M:%S", time.localtime(r["ts"])), r["agent"], r["model"] or "-",
+            _fmt(r["latency_ms"]), "yes" if r["fallback"] else "no", (r["input_summary"] or "-")[:60],
+            (r["output_json"] or "-")[:70], r["error"] or "-",
+        )
+    console.print(t)

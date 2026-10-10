@@ -51,3 +51,37 @@ heartbeat_s = 1.0         # controller heartbeat period during an experiment
 
 [map]
 lookback_min = 60         # Jaeger lookback for dynamic edges and journey traces
+
+[llm]
+planner_model = "llama-3.3-70b-versatile"
+analyst_model = "llama-3.3-70b-versatile"
+fixer_model = "llama-3.3-70b-versatile"
+safety_model = "llama-3.1-8b-instant"
+rate_per_min = 25         # shared token bucket across all agents
+timeout_s = 20            # per LLM request
+
+[planner]
+top_k = 8                 # candidates sent to the LLM
+max_attempts = 3          # ranked candidates tried before giving up on validation
+max_per_target = 2        # diversity cap inside the top-k
+duration_s = 20           # delay-fault duration
+crash_duration_s = 20     # crash-fault duration
+delay_ms = [100, 300]     # delay intensity menu
+loss_pct = [10]           # packet-loss intensity menu (with 1 ms delay)
+exclude = []              # extra targets the planner never proposes (allowlist is [safety].allow)
+history = 10              # past experiments read for the recent_result component
+
+[planner.weights]
+# score = sum(weight * component); components are 0..1 except recent_result (-1..1)
+fan_in = 1.0              # services that call the target, scaled by the busiest node
+journeys = 2.0            # share of journeys whose path includes the target
+stateful = 1.0            # 1 if the target is a data store or broker
+untested = 1.5            # 1 never tested with this fault, 0.5 target tested with another fault, 0 same fault tested
+recent = 1.5              # neighbours of a degraded target up, targets that held up down
+severity = 0.5            # fault strength, see [planner.severity]
+
+[planner.severity]
+crash = 1.0
+delay300 = 0.6
+loss = 0.5
+delay100 = 0.3

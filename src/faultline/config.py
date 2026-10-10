@@ -33,6 +33,27 @@ DEFAULTS = {
     },
     "reaper": {"interval_s": 2.0, "stale_s": 10, "heartbeat_s": 1.0},
     "map": {"lookback_min": 60},
+    "llm": {
+        "planner_model": "llama-3.3-70b-versatile",
+        "analyst_model": "llama-3.3-70b-versatile",
+        "fixer_model": "llama-3.3-70b-versatile",
+        "safety_model": "llama-3.1-8b-instant",
+        "rate_per_min": 25,
+        "timeout_s": 20,
+    },
+    "planner": {
+        "top_k": 8,
+        "max_attempts": 3,
+        "max_per_target": 2,
+        "duration_s": 20,
+        "crash_duration_s": 20,
+        "delay_ms": [100, 300],
+        "loss_pct": [10],
+        "exclude": [],
+        "history": 10,
+        "weights": {"fan_in": 1.0, "journeys": 2.0, "stateful": 1.0, "untested": 1.5, "recent": 1.5, "severity": 0.5},
+        "severity": {"crash": 1.0, "delay300": 0.6, "loss": 0.5, "delay100": 0.3},
+    },
 }
 
 
