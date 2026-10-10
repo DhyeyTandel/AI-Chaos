@@ -53,10 +53,10 @@ heartbeat_s = 1.0         # controller heartbeat period during an experiment
 lookback_min = 60         # Jaeger lookback for dynamic edges and journey traces
 
 [llm]
-planner_model = "llama-3.3-70b-versatile"
-analyst_model = "llama-3.3-70b-versatile"
-fixer_model = "llama-3.3-70b-versatile"
-safety_model = "llama-3.1-8b-instant"
+planner_model = "openai/gpt-oss-120b"
+analyst_model = "openai/gpt-oss-120b"
+fixer_model = "openai/gpt-oss-120b"
+safety_model = "openai/gpt-oss-20b"
 rate_per_min = 25         # shared token bucket across all agents
 timeout_s = 20            # per LLM request
 
