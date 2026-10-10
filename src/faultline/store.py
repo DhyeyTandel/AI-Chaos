@@ -128,7 +128,12 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 
 MIGRATIONS = {
     "agent_trace": {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"},
-    "experiments": {"abort_source": "TEXT", "safety_checks": "INTEGER NOT NULL DEFAULT 0", "safety_decisions": "TEXT"},
+    "experiments": {
+        "abort_source": "TEXT", "safety_checks": "INTEGER NOT NULL DEFAULT 0", "safety_decisions": "TEXT",
+        "preflight_review": "TEXT",
+    },
+    "runs": {"memory": "TEXT"},
+    "run_rounds": {"preflight": "TEXT"},
 }
 
 

@@ -262,3 +262,23 @@ def test_fixer_override_bare_service_body_is_wrapped(cfg):
     assert err is None and out.startswith("services:\n  cart:\n    restart: on-failure")
     assert fixer.check_override("restart: on-failure\n", {"cart"})[0] is None
     assert fixer.check_override("image: x\n", {"cart"}, "cart")[0] is None
+
+
+def test_report_shows_learned_limits_and_safety_review(cfg, store, tmp_path, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    sample_analysis(cfg, store)
+    pf = {"decision": "reduce", "reason": "close to a known limit", "fallback": 0, "error": None,
+          "original": {"params": {"delay_ms": 300.0}, "duration_s": 20.0}, "final": {"params": {"delay_ms": 100.0}, "duration_s": 20.0},
+          "vetoed": [{"candidate": "crash:quote:20s", "reason": "repeats a known abort"}]}
+    with store.conn:
+        store.conn.execute("UPDATE run_rounds SET preflight = ? WHERE round = 1", (json.dumps(pf),))
+        store.conn.execute("UPDATE experiments SET preflight_review = ? WHERE id = 'e1'", (json.dumps(pf),))
+    reason = "delay on quote aborted at 100 ms in exp-old; 300 ms excluded"
+    limit = {"target": "quote", "kind": "delay", "intensity": 100.0, "label": "100 ms", "experiment_id": "exp-old", "source": "watchdog", "at": 0}
+    runs.update(store, "run-test", memory={"limits": [limit], "exclusions": [{"candidate": "delay:quote:300ms", "reason": reason, "evidence": "exp-old"}]})
+    state = plan_graph.run_report(cfg, gmap(), store, tmp_path, "run-test")
+    md = (tmp_path / "run-test" / "report.md").read_text()
+    assert "## Learned limits" in md and reason in md and "exp-old" in md and "100 ms" in md
+    assert "reduced delay 300 -> 100 ms: close to a known limit" in md and "Safety review" in md
+    assert "crash:quote:20s (repeats a known abort)" in md and "Pre-flight review: 1 reviews" in md and "1 vetoes" in md
+    assert state["data"]["learned_limits"]["limits"][0]["experiment_id"] == "exp-old"

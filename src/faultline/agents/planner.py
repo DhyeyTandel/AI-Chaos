@@ -2,8 +2,9 @@ import json
 
 from pydantic import BaseModel, Field, field_validator
 
+from .. import analyzer
 from .. import baseline as bl
-from .. import faults, llm
+from .. import faults, llm, memory
 
 TEMPLATE_FAULT = {
     "crash": "is crashed",
@@ -39,13 +40,18 @@ class RankedItem(BaseModel):
     @field_validator("reason", mode="before")
     @classmethod
     def _trim(cls, v):
-        return str(v)[:200]
+        return analyzer.clean(str(v))[:200]
 
 
 class PlannerOut(BaseModel):
     ranking: list[RankedItem]
     hypothesis: str
     predicted_blast_radius: list[str] = Field(default_factory=list)
+
+    @field_validator("hypothesis", mode="before")
+    @classmethod
+    def _clean(cls, v):
+        return analyzer.clean(str(v))
 
 
 class PlanResult(BaseModel):
@@ -57,6 +63,8 @@ class PlanResult(BaseModel):
     model: str
     latency_ms: float = 0.0
     cached: bool = False
+    exclusions: list[dict] = Field(default_factory=list)
+    limits: list[dict] = Field(default_factory=list)
 
 
 def load_map(cfg, overrides_path, out_path) -> dict:
@@ -115,7 +123,7 @@ def generate_candidates(cfg, graph: dict) -> list[Candidate]:
 
 
 def history(store, limit: int) -> list[dict]:
-    rows = store.conn.execute("SELECT * FROM experiments ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = store.conn.execute("SELECT * FROM experiments WHERE state != 'VETOED' ORDER BY created_at DESC LIMIT ?", (limit,))
     out = []
     for r in rows:
         r = dict(r)
@@ -236,7 +244,7 @@ def template_hypothesis(graph: dict, c: Candidate) -> str:
     )
 
 
-def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], strategy: str | None = None) -> str:
+def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], strategy: str | None = None, limits: list[dict] | None = None) -> str:
     nodes = ",".join(n + ("*" if a.get("stateful") else "") for n, a in sorted(graph["nodes"].items()) if a.get("kind") in ("app", "infra"))
     edges = ",".join(f"{e['source']}>{e['target']}" for e in graph["edges"])
     journeys = "; ".join(f"{j}: {','.join(v['services'])}" for j, v in (graph.get("journeys") or {}).items())
@@ -259,6 +267,8 @@ def build_context(cfg, graph: dict, store, top: list[Scored], hist: list[dict], 
         f"Services (* stateful): {nodes}\nCalls (caller>callee): {edges}\nJourneys: {journeys}\n"
         f"Baseline: {base}\nLast experiments: {h}\n"
     )
+    if limits:
+        out += f"Known limits (aborted by watchdog or safety agent in earlier runs, lowest intensity): {memory.prompt_text(limits)}\n"
     if strategy:
         out += f"Strategy: {strategy}\n"
     return out + f"Candidates:\n{cand}"
@@ -272,6 +282,10 @@ SYSTEM = (
     '"hypothesis":"what you expect to happen for the rank 1 pick","predicted_blast_radius":["service or journey names affected by the rank 1 pick"]}. '
     "Include every candidate exactly once."
 )
+LIMITS_NOTE = (
+    " The user message lists known limits: fault intensities that earlier runs aborted. Candidates at or above them were removed. "
+    "When a pick sits close to a limit, say so in its reason."
+)
 RUN_NOTE = (
     " The user message gives the run strategy (survivable first, climb as results come in). "
     "Let your reasons reflect it: say why the pick fits the current tier and what the earlier results suggest."
@@ -283,14 +297,19 @@ def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier:
     top_k = top_k or cfg.planner.top_k
     hist = history(store, cfg.planner.history)
     cands = [c for c in generate_candidates(cfg, graph) if (max_tier is None or c.tier <= max_tier) and c.target not in exclude]
+    limits = memory.known_limits(cfg, store)
+    cands, excluded = memory.exclusions(cands, limits)
     scored = score_candidates(cfg, graph, hist, cands)
     top = select_top(cfg, scored, top_k)
     model = cfg.llm.planner_model
     if not top:
-        return PlanResult(ranked=[], hypothesis="", blast_radius=[], fallback=True, fallback_reason="no candidates", model=model)
-    ctx = build_context(cfg, graph, store, top, hist, strategy)
+        return PlanResult(
+            ranked=[], hypothesis="", blast_radius=[], fallback=True, fallback_reason="no candidates", model=model,
+            exclusions=excluded, limits=limits,
+        )
+    ctx = build_context(cfg, graph, store, top, hist, strategy, limits)
     out, meta = llm.call_structured(
-        "planner", model, PlannerOut, SYSTEM + (RUN_NOTE if strategy else ""), ctx, cfg.llm.timeout_s, store=store,
+        "planner", model, PlannerOut, SYSTEM + (RUN_NOTE if strategy else "") + (LIMITS_NOTE if limits else ""), ctx, cfg.llm.timeout_s, store=store,
         input_summary=f"{len(top)} candidates, {len(graph['nodes'])} nodes, {len(hist)} past experiments", chat=chat,
     )
     by_id = {s.candidate.id: s for s in top}
@@ -322,7 +341,7 @@ def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None, max_tier:
         hyp = out.hypothesis or template_hypothesis(graph, first)
     return PlanResult(
         ranked=ordered, hypothesis=hyp, blast_radius=blast, fallback=fallback, fallback_reason=meta["error"] if fallback else None,
-        model=model, latency_ms=meta["latency_ms"], cached=meta["cached"],
+        model=model, latency_ms=meta["latency_ms"], cached=meta["cached"], exclusions=excluded, limits=limits,
     )
 
 

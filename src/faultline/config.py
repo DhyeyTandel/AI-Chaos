@@ -31,7 +31,7 @@ DEFAULTS = {
         "crash_exclude": ["frontend-proxy"],
         "expiry_margin_s": 5,
     },
-    "safety_agent": {"enabled": True, "interval_s": 10, "first_check_s": 5, "timeout_s": 8},
+    "safety_agent": {"enabled": True, "interval_s": 10, "first_check_s": 5, "timeout_s": 8, "review": True},
     "reaper": {"interval_s": 2.0, "stale_s": 10, "heartbeat_s": 1.0},
     "map": {"lookback_min": 60},
     "llm": {
@@ -57,6 +57,7 @@ DEFAULTS = {
         "loss_pct": [10],
         "exclude": [],
         "history": 10,
+        "memory": {"enabled": True, "lookback_days": 7},
         "weights": {"fan_in": 1.0, "journeys": 2.0, "stateful": 1.0, "untested": 1.5, "recent": 1.5, "severity": 0.5},
         "severity": {"crash": 1.0, "delay300": 0.6, "loss": 0.5, "delay50": 0.2},
         "tiers": {"light_delay_ms": 50, "critical": ["flagd"], "overrides": {"delay:frontend:50ms": 2, "delay:product-catalog:50ms": 2}},

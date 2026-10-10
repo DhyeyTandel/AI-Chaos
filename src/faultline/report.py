@@ -3,7 +3,7 @@ import json
 import time
 from pathlib import Path
 
-from . import analyzer
+from . import analyzer, memory
 from .agents import safety
 
 MARKER_INPUTS = ("ranking validation", "weakness validation", "fix validation")
@@ -65,7 +65,7 @@ def ai_usage(store, run: dict, since: float, results: dict) -> list[dict]:
 def methodology_text(cfg) -> list[str]:
     return [
         "An independent synthetic prober exercises four user journeys (home, product, cart, checkout) through the front proxy every second. It is the ground truth and does not depend on the application's own telemetry.",
-        "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober. An advisory safety agent re-checks the live measurements every few seconds and may abort earlier; it can never cancel a watchdog abort, extend a fault or change a threshold.",
+        "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober. Before injection, the safety agent reviews the plan against the baseline limits, recent outcomes and the learned limits, and may approve it, reduce its intensity or veto it; it can never raise an intensity. The planner remembers, across runs, the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose that intensity or a higher one again within the lookback window. An advisory safety agent re-checks the live measurements every few seconds and may abort earlier; it can never cancel a watchdog abort, extend a fault or change a threshold.",
         "Each experiment injects one fault (container crash, added network delay or packet loss), measures every journey during the fault window (up to the abort for aborted runs), reverts the fault, and measures how long the journeys take to return inside the baseline band.",
         "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
         f"A hidden dependency is a journey that degraded by at least {cfg.score.hidden_min_impact} although neither the hypothesis nor the dependency map expected it.",
@@ -91,6 +91,25 @@ def rating(score) -> str:
     return "n/a" if score is None else "good" if score >= 80 else "fair" if score >= 60 else "poor"
 
 
+def learned_limits(cfg, run: dict, analysis: dict) -> dict:
+    mem = run.get("memory") or {}
+    new = [
+        {"experiment_id": a["experiment_id"], "target": a["target"], "fault": a["label"], "source": a["abort_source"]}
+        for a in analysis["experiments"]
+        if a["scope"] == "run" and a["outcome"] == "ABORTED" and a["abort_source"] in memory.SAFETY_SOURCES
+    ]
+    return {
+        "enabled": memory.enabled(cfg), "lookback_days": cfg.planner.memory.lookback_days,
+        "limits": mem.get("limits") or [], "exclusions": mem.get("exclusions") or [], "new": new,
+    }
+
+
+def preflight_data(rounds: list[dict]) -> dict:
+    reviews = [r["preflight"] for r in rounds if r.get("preflight") and r["preflight"].get("decision")]
+    vetoed = [{"round": r["round"], **v} for r in rounds for v in ((r.get("preflight") or {}).get("vetoed") or [])]
+    return {"reviews": reviews, "vetoed": vetoed}
+
+
 def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res, fixer_res, since: float) -> dict:
     fixes = {f.weakness_rank: f for f in fixer_res.fixes}
     weaknesses = [{**w.model_dump(), "fix": fixes[w.rank].model_dump() if w.rank in fixes else None} for w in analyst_res.weaknesses]
@@ -106,6 +125,7 @@ def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res
         "services": analysis["services"], "untested_services": analysis["untested"],
         "score_config": {k: v for k, v in vars(cfg.score).items()}, "formula": analyzer.formula_text(cfg),
         "methodology": methodology_text(cfg), "ai_usage": ai_usage(store, run, since, results),
+        "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, run, analysis),
         "notes": {"analyst_dropped": analyst_res.dropped, "fixer_filled_by_fallback": fixer_res.filled},
     })
 
@@ -139,16 +159,20 @@ def blocks(cfg, d: dict) -> list:
     hist = [a for a in d["experiments"] if a["scope"] == "history"]
     b.append(("h", 2, "Experiments in this run", ""))
     cut = lambda s, n: (s or "-") if len(s or "") <= n else s[: n - 3] + "..."
-    b.append(("table", ["Round", "Tier", "Fault", "Target", "AI reason", "Hypothesis", "Verdict", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Safety agent", "Outcome"],
+    b.append(("table", ["Round", "Tier", "Fault", "Target", "AI reason", "Hypothesis", "Verdict", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Safety review", "Safety agent", "Outcome"],
               [[a["round"], a["tier"], a["label"], a["target"], cut(a["reason"], 140), cut(a["hypothesis"], 140), a["verdict"],
-                ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", safety.describe(a["safety_decisions"]),
+                ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", cut(safety.describe_review(a["preflight"]), 120), safety.describe(a["safety_decisions"]),
                 a["outcome"] + (f" by {a['abort_source']}" if a["abort_source"] else "") + (f" ({cut(a['abort_reason'], 60)})" if a["abort_reason"] else "")] for a in run_exps]))
+    if d["preflight"]["vetoed"]:
+        b.append(("p", "Vetoed by the pre-flight safety review (not injected, not counted as aborts): " + "; ".join(
+            f"round {v['round']} {v['candidate']} ({cut(v['reason'], 120)})" for v in d["preflight"]["vetoed"])))
     if hist:
         b.append(("h", 2, "Earlier experiments in the database", ""))
         b.append(("p", "These ran before this run and count toward service scores and hidden dependency findings."))
         b.append(("table", ["Experiment", "Fault", "Target", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Outcome"],
                   [[a["experiment_id"], a["label"], a["target"], ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}",
                     fmt_rec(a), f"{a['penalty']:.0f}", a["outcome"]] for a in hist]))
+    b += learned_blocks(d["learned_limits"])
     b.append(("h", 2, "Hidden dependencies", ""))
     if d["hidden_dependencies"]:
         b.append(("table", ["Experiment", "Scope", "Fault", "Target", "Unexpected journeys", "Worst degradation", "Map"],
@@ -165,9 +189,40 @@ def blocks(cfg, d: dict) -> list:
     b.append(("table", ["Agent", "Path", "Groq calls", "Fallbacks", "Cached", "Prompt tokens", "Completion tokens"],
               [[u["agent"], u["path"], u["groq_calls"], u["fallbacks"], u["cached"], u["prompt_tokens"], u["completion_tokens"]] for u in d["ai_usage"]]))
     b.append(("p", safety_summary(run_exps)))
+    b.append(("p", review_summary(d["preflight"])))
     n = d["notes"]
     b.append(("p", f"Analyst weaknesses dropped by validation: {n['analyst_dropped']}. Fixes filled by the rule-based catalog: {n['fixer_filled_by_fallback']}."))
     return b
+
+
+def learned_blocks(m: dict) -> list:
+    b: list = [("h", 2, "Learned limits", "")]
+    if not m["enabled"]:
+        return b + [("p", "Cross-run planner memory is disabled ([planner.memory] enabled = false).")]
+    b.append(("p", f"Lowest fault intensity per target and fault kind that the watchdog or safety agent aborted in the last {m['lookback_days']} days, as known when this run started. The planner does not propose that intensity or a higher one."))
+    if m["limits"]:
+        b.append(("table", ["Target", "Fault", "Lowest aborted intensity", "Aborted by", "Evidence"],
+                  [[x["target"], x["kind"], x["label"], x["source"], x["experiment_id"]] for x in m["limits"]]))
+    else:
+        b.append(("p", "None known at the start of this run."))
+    if m["exclusions"]:
+        b += [("p", "Candidates excluded during this run:"), ("table", ["Candidate", "Reason", "Evidence"],
+              [[x["candidate"], x["reason"], x["evidence"]] for x in m["exclusions"]])]
+    if m["new"]:
+        b.append(("p", "New limits learned in this run: " + "; ".join(f"{x['fault']} on {x['target']} aborted by {x['source']} ({x['experiment_id']})" for x in m["new"]) + "."))
+    return b
+
+
+def review_summary(pf: dict) -> str:
+    recs = pf["reviews"]
+    if not recs and not pf["vetoed"]:
+        return "Pre-flight review: none recorded in this run (disabled or no key)."
+    s = safety.summarize_reviews(recs)
+    return (
+        f"Pre-flight review: {s['reviews']} reviews of executed experiments (approve {s['approve']}, reduce {s['reduce']}, "
+        f"fallback approvals {s['fallback']}) and {len(pf['vetoed'])} vetoes that skipped a candidate. "
+        "A veto counts as a planner attempt, not as an abort. A failed review approves, and the validator and watchdog still apply."
+    )
 
 
 def safety_summary(exps: list[dict]) -> str:

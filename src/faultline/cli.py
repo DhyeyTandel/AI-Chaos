@@ -219,6 +219,10 @@ def _safety_line(e: dict) -> str:
     return line + (f"; aborted by {e['abort_source']}" if e["state"] == "ABORTED" and e["abort_source"] else "")
 
 
+def _review_line(rec: dict | None) -> str:
+    return f"Safety review: {safety_mod.describe_review(rec)}"
+
+
 def _print_experiment(e: dict):
     t = Table("id", "fault", "target", "state", "recovery s", "abort reason")
     rec = e["recovery_seconds"]
@@ -226,9 +230,11 @@ def _print_experiment(e: dict):
         e["id"], e["fault"], e["target"], e["state"],
         "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}"),
         e["abort_reason"] or "-",
-        style="red" if e["state"] == "ABORTED" else "green",
+        style="red" if e["state"] in ("ABORTED", "VETOED") else "green",
     )
     console.print(t)
+    if e["preflight_review"]:
+        console.print(_review_line(e["preflight_review"]), markup=False, highlight=False)
     console.print(_safety_line(e), markup=False, highlight=False)
     if e["impact"]:
         it = Table("journey", "n", "err % (fault)", "err % (base)", "p95 ms (fault)", "p95 ms (base)")
@@ -247,11 +253,14 @@ def _revert_own(store, driver, cfg):
         inj.revert_experiment(exp_id)
 
 
-def _run_experiment(store, cfg, fault, target, duration, params, context=None) -> dict:
+def _run_experiment(store, cfg, fault, target, duration, params, context=None, graph=None, review=False) -> dict:
     driver = faults.DockerDriver()
     try:
         return asyncio.run(
-            exp_mod.run_experiment(store, driver, cfg, fault, target, duration, params, log=lambda m: console.print(m, markup=False, highlight=False), context=context)
+            exp_mod.run_experiment(
+                store, driver, cfg, fault, target, duration, params, log=lambda m: console.print(m, markup=False, highlight=False),
+                context=context, auto_review=review, graph=graph,
+            )
         )
     except faults.ValidationError as e:
         console.print(f"rejected: {e}", markup=False)
@@ -274,13 +283,13 @@ def experiment(
     """Run one guarded fault injection with watchdog, revert, and recovery measurement."""
     cfg = load_config()
     store = Store()
-    context = None
+    context = gmap = None
     try:
         gmap = planner_mod.load_map(cfg, os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml"), _data_dir() / "map.json")
         context = safety_mod.context_from_map(gmap, target)
     except Exception:
         pass
-    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct}, context)
+    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct}, context, gmap, review=True)
     _print_experiment(e)
     raise typer.Exit(0 if e["state"] == "COMPLETED" else 1)
 
@@ -389,6 +398,10 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
         params = ",".join(f"{k}={v:g}" for k, v in c.params.items() if v) or "-"
         t.add_row(str(i), c.id, c.target, c.fault, f"{params} {c.duration_s}s", f"{s.det_score:.2f}", str(s.llm_rank or "-"), s.reason)
     console.print(t)
+    for x in res.exclusions:
+        console.print(f"memory: excluded {x['candidate']}: {x['reason']}", markup=False, highlight=False)
+    if res.limits:
+        console.print(f"memory: {len(res.limits)} learned limits, {len(res.exclusions)} candidates excluded", markup=False)
     pick = state.get("selected")
     for r in state.get("rejected", []):
         console.print(f"validator rejected {r['candidate']}: {r['reason']}", markup=False)
@@ -461,11 +474,11 @@ def run_cmd(
     with runs_mod.RunControl() as control:
         control.install_signals()
 
-        def runner(c, context=None):
+        def runner(c, context=None, review=None):
             try:
                 return asyncio.run(exp_mod.run_experiment(
                     store, driver, cfg, c.fault, c.target, c.duration_s, dict(c.params),
-                    log=lambda m: console.print(m, markup=False, highlight=False), context=context,
+                    log=lambda m: console.print(m, markup=False, highlight=False), context=context, review=review,
                 ))
             except KeyboardInterrupt:
                 console.print("interrupted; reverting", markup=False)
@@ -533,6 +546,8 @@ def runs_show(run_id: str = typer.Argument(None, help="Run id (default: latest)"
         raise typer.Exit(1)
     rows = runs_mod.rounds(store, run["run_id"])
     _print_run(run, rows)
+    for x in (run["memory"] or {}).get("exclusions", []):
+        console.print(f"memory: excluded {x['candidate']}: {x['reason']}", markup=False, highlight=False)
     for r in rows:
         console.print(f"round {r['round']} {r['candidate_id']}: {r['hypothesis']}", markup=False, highlight=False)
         console.print(
@@ -540,6 +555,12 @@ def runs_show(run_id: str = typer.Argument(None, help="Run id (default: latest)"
             + (f"; abort: {r['abort_reason']}" if r["abort_reason"] else ""),
             markup=False, highlight=False,
         )
+        pf = r["preflight"]
+        if pf:
+            for v in pf.get("vetoed", []):
+                console.print(f"  safety review vetoed {v['candidate']}: {v['reason']}", markup=False, highlight=False)
+            if pf.get("decision"):
+                console.print("  " + _review_line(pf), markup=False, highlight=False)
         if r["experiment_id"]:
             e = exp_mod.get(store, r["experiment_id"])
             console.print("  " + _safety_line(e), markup=False, highlight=False)

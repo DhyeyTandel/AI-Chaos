@@ -80,7 +80,7 @@ def ecfg(cfg, store, tmp_path, monkeypatch):
     return cfg
 
 
-def go(monkeypatch, ecfg, store, driver, sim, duration=2, chat=None, context=None, log=None):
+def go(monkeypatch, ecfg, store, driver, sim, duration=2, chat=None, context=None, log=None, **kw):
     async def fake_probe(st, seconds, timeout=3.0, stop=None):
         while not stop.is_set():
             t = time.time()
@@ -90,7 +90,7 @@ def go(monkeypatch, ecfg, store, driver, sim, duration=2, chat=None, context=Non
 
     monkeypatch.setattr(exp_mod, "run_probe", fake_probe)
     return asyncio.run(exp_mod.run_experiment(
-        store, driver, ecfg, "crash", "ad", duration, {}, log=log or (lambda m: None), context=context, chat=chat,
+        store, driver, ecfg, "crash", "ad", duration, {}, log=log or (lambda m: None), context=context, chat=chat, **kw,
     ))
 
 
@@ -265,3 +265,42 @@ def test_safety_out_validation():
     assert o.decision == "abort" and len(o.reason) == 200 and o.concern_level == "high"
     with pytest.raises(Exception):
         safety.SafetyOut.model_validate({"decision": "maybe", "reason": "r", "concern_level": "low"})
+
+
+def review_json(decision, reason="because", reduced=None):
+    return json.dumps({"decision": decision, "reason": reason, **({"reduced_params": reduced} if reduced else {})})
+
+
+def test_standalone_review_veto_skips_injection(monkeypatch, ecfg, store):
+    sim, logs = Sim(), []
+    driver = SimDriver(sim)
+    chat = FakeChat(lambda n: review_json("veto", "repeats a known abort"))
+    e = go(monkeypatch, ecfg, store, driver, sim, chat=chat, auto_review=True, log=logs.append)
+    assert e["state"] == "VETOED" and chat.calls == 1 and not driver.applied and not Ledger(store).all()
+    assert e["preflight_review"]["decision"] == "veto" and "repeats a known abort" in e["abort_reason"]
+    assert any(m == "Safety review: vetoed: repeats a known abort" for m in logs)
+    from faultline import memory
+
+    assert memory.known_limits(ecfg, store) == []
+
+
+def test_standalone_review_reduces_and_records(monkeypatch, ecfg, store):
+    sim = Sim()
+    chat = FakeChat(lambda n: review_json("reduce", "shorter is enough", {"duration_s": 10}) if n == 1 else verdict("continue", "ok", "low"))
+    e = go(monkeypatch, ecfg, store, SimDriver(sim), sim, duration=11, chat=chat, auto_review=True)
+    assert e["state"] == "COMPLETED" and e["params"]["duration_s"] == 10
+    pf = e["preflight_review"]
+    assert pf["decision"] == "reduce" and pf["original"]["duration_s"] == 11 and pf["final"]["duration_s"] == 10
+    assert e["finished_at"] - e["injected_at"] < 14
+
+
+def test_standalone_review_failure_approves_and_runs(monkeypatch, ecfg, store):
+    sim = Sim()
+    e = go(monkeypatch, ecfg, store, SimDriver(sim), sim, duration=2, chat=FakeChat(lambda n: "junk"), auto_review=True)
+    assert e["state"] == "COMPLETED" and e["preflight_review"]["fallback"] == 1 and e["preflight_review"]["decision"] == "approve"
+
+
+def test_review_not_called_unless_requested(monkeypatch, ecfg, store):
+    chat = FakeChat(lambda n: review_json("veto"))
+    e = go(monkeypatch, ecfg, store, SimDriver(Sim()), Sim(), chat=chat)
+    assert e["state"] == "COMPLETED" and e["preflight_review"] is None

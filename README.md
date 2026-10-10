@@ -7,7 +7,7 @@ Built for the Bosch hackathon "AI-Driven Chaos Engineering for Cloud-Native Resi
 ## What it does
 
 1. **Map.** Builds a service dependency map from the Compose files plus live Jaeger traces, and derives four user journeys (home, product, cart, checkout). Flags dependencies seen only in traces or only in config.
-2. **Plan.** Scores every candidate fault deterministically (fan-in, journeys affected, stateful, untested, recent results, severity). An LLM ranks the top 8 with a reason, a hypothesis and a predicted blast radius. A validator rejects unsafe picks.
+2. **Plan.** Scores every candidate fault deterministically (fan-in, journeys affected, stateful, untested, recent results, severity). The planner remembers across runs the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose it again. An LLM ranks the top 8 with a reason, a hypothesis and a predicted blast radius. A validator rejects unsafe picks, and the safety agent reviews the pick before injection (approve, reduce or veto).
 3. **Inject safely.** Container crashes and network delay, jitter and packet loss, each recorded in a write-ahead ledger before being applied, watched every second, and reverted automatically.
 4. **Observe.** A prober runs the four journeys continuously against a measured baseline. Recovery time is measured after each revert.
 5. **Report.** An analyst agent ranks weaknesses with evidence, a fixer agent proposes fixes, and a resilience score is computed. Output is `report.md`, `report.html` and `report.json`.
@@ -68,10 +68,10 @@ All commands run as `docker compose run --rm faultline <command>`.
 | `probe --seconds N` | Run the journey prober and print per-journey success and latency |
 | `map` | Build the dependency map and journeys, print hidden-dependency candidates and a Mermaid graph |
 | `baseline [--seconds N] [--warmup N] [--show]` | Measure steady state and derive watchdog thresholds |
-| `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]` | One guarded fault with watchdog, revert and recovery measurement |
-| `plan [--top N]` | Rank candidate faults and validate the pick, without running it |
+| `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]` | One guarded fault: pre-flight safety review, then watchdog, revert and recovery measurement |
+| `plan [--top N]` | Rank candidate faults and validate the pick, without running it; lists candidates excluded by learned limits |
 | `run [--rounds N] [--report]` | Autonomous loop: plan, validate, execute, record, climb the risk ladder (1 to 8 rounds, default 3) |
-| `runs show [RUN_ID]` | Print a stored run with hypotheses and safety-agent decisions |
+| `runs show [RUN_ID]` | Print a stored run with hypotheses, pre-flight reviews, vetoes, exclusions and safety-agent decisions |
 | `report [--run RUN_ID]` | Analyze a stored run and write the report files under `reports/<run_id>/` |
 | `ledger [-n N]` | Show the fault ledger |
 | `stop` | Kill switch: revert every open fault and remove sidecars |
@@ -100,6 +100,8 @@ Faults are never applied without these layers in place. Each is independent of t
 | Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 % |
 | Write-ahead ledger | The fault is recorded in SQLite before it is applied, so anything left over can be found and reverted |
 | Watchdog | Every 1 s, judges each journey against thresholds derived from the baseline (error rate and p95, with floors in `faultline.toml`); aborts on breach, or if no samples arrive for 5 s |
+| Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |
+| Cross-run planner memory | The lowest intensity per target and fault kind that the watchdog or safety agent aborted in the last 7 days is never proposed again (`[planner.memory]`). Aborts by the operator, preflight, inject or system are ignored |
 | Safety agent | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
 | Reaper | Separate always-on container; reverts faults past expiry, or all faults if the controller heartbeat is older than 10 s (measured live: 13 s) |
@@ -124,13 +126,15 @@ LangGraph pipeline; models are served by Groq's free tier.
 
 | Agent | Model | Decides | Fallback without LLM |
 |---|---|---|---|
-| Planner | `openai/gpt-oss-120b` (reasoning effort low) | Ranks the top 8 scored candidates, with a reason, hypothesis and predicted blast radius | Deterministic score order |
+| Planner | `openai/gpt-oss-120b` (reasoning effort low) | Ranks the top 8 scored candidates, with a reason, hypothesis and predicted blast radius; sees the learned limits | Deterministic score order |
 | Validator | none (rules) | Rejects candidates that break the safety rules or run while faults are active | Not an LLM |
 | Analyst | `openai/gpt-oss-120b` | Ranks weaknesses with evidence and severity | Penalty-ranked weaknesses |
 | Fixer | `openai/gpt-oss-120b` | Proposes fixes, including validated Compose overrides (proposed only, never applied) | Fallback fixes |
-| Safety agent | `openai/gpt-oss-20b` | Live continue or abort advice during a fault | Ignored; watchdog verdict stands |
+| Safety agent | `openai/gpt-oss-20b` (reasoning effort low) | Pre-flight review (approve, reduce or veto) before injection; live continue or abort advice during a fault | Review approves; live checks ignored; watchdog verdict stands |
 
 The planner climbs a risk ladder: tier 1 (50 ms delays, crashes of services no journey needs), tier 2 (300 ms delay, 10 % loss, partial-impact crashes, core-path delays), tier 3 (critical or stateful crashes, including flagd). It climbs after 2 survived experiments at a tier, and a target that triggers an abort is excluded.
+
+Cross-run memory: before each plan, `faultline` reads the experiments table and builds the known limits. Candidates at or above a known abort intensity for the same target and fault kind are excluded with a recorded reason, shown by `plan` and `run`, and listed with their evidence experiment ids in the report's "Learned limits" section. A pre-flight veto skips the candidate and asks for the next ranked one; it counts as a planner attempt, not as an abort, and does not exclude the target.
 
 Token budget handling: a per-model limiter (8000 tokens/min), a daily budget per model (180,000 tokens), a 6 h response cache, and `agents usage` to inspect it. Calls fall back when a limit is hit.
 
@@ -141,7 +145,8 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 - **Risk ladder.** One run climbed from tier 1 to tier 2: 50 ms delays on astronomy-db and frontend-proxy completed, then a crash of cart was aborted by the watchdog at cart p95 3007 ms (recovery 6 s).
 - **Hidden dependency.** Crashing flagd, which is on no journey in the map, pushed cart p95 to about 3 s.
 - **Latency without errors.** 10 % packet loss on currency raised checkout p95 from 74 ms to 410 ms with zero errors.
-- **Score.** The sample report scores the shop 37.9 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on.
+- **Pre-flight review and memory.** In the sample run the planner already knew six learned limits (for example delay on product-catalog aborted at 100 ms), the safety review vetoed one candidate before injection and approved the other three, and a 50 ms delay on astronomy-db was then aborted by the live safety agent because checkout p95 rose to 285 ms against a 74 ms baseline.
+- **Score.** The sample report scores the shop 37.5 / 100 overall. Per experiment, penalty = 100 x (0.5 impact + 0.3 breadth + 0.2 recovery); a service scores 100 minus its worst penalty; the overall score is the mean of service scores weighted by the number of journeys each service sits on.
 
 ## Status
 
@@ -154,6 +159,8 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Analyst, fixer, resilience score, Markdown/HTML/JSON report | Done |
 | Token budget, cache, agent trace | Done |
 | Safety agent (live advisory) | Done (gpt-oss-20b, verified live) |
+| Pre-flight safety review (approve, reduce, veto) | Done |
+| Cross-run planner memory and learned limits | Done |
 | Auto-apply of proposed fixes | Future |
 | Dashboard | Future |
 | Combined (multi-fault) failures | Future |

@@ -13,8 +13,9 @@ from .prober import run_probe
 
 ROUND_COLS = (
     "round", "tier", "candidate_id", "fault", "target", "params", "llm_rank", "reason", "fallback", "hypothesis",
-    "predicted_blast_radius", "experiment_id", "outcome", "abort_reason", "recovery_s", "climb_decision",
+    "predicted_blast_radius", "experiment_id", "outcome", "abort_reason", "recovery_s", "climb_decision", "preflight",
 )
+JSON_COLS = ("params", "predicted_blast_radius", "preflight")
 
 
 def new_run_id() -> str:
@@ -27,13 +28,15 @@ def start(store, run_id: str, rounds: int):
 
 
 def update(store, run_id: str, **cols):
+    if "memory" in cols and cols["memory"] is not None:
+        cols["memory"] = json.dumps(cols["memory"])
     keys = ", ".join(f"{k} = ?" for k in cols)
     with store.conn:
         store.conn.execute(f"UPDATE runs SET {keys} WHERE run_id = ?", (*cols.values(), run_id))
 
 
 def add_round(store, run_id: str, row: dict):
-    vals = [json.dumps(row[c]) if c in ("params", "predicted_blast_radius") else row[c] for c in ROUND_COLS]
+    vals = [json.dumps(row.get(c)) if c in JSON_COLS and row.get(c) is not None else row.get(c) for c in ROUND_COLS]
     with store.conn:
         store.conn.execute(
             f"INSERT INTO run_rounds (run_id, {', '.join(ROUND_COLS)}) VALUES ({', '.join('?' * (len(ROUND_COLS) + 1))})",
@@ -46,7 +49,11 @@ def get(store, run_id: str | None = None) -> dict | None:
         r = store.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     else:
         r = store.conn.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    r = dict(r)
+    r["memory"] = json.loads(r["memory"]) if r.get("memory") else None
+    return r
 
 
 def rounds(store, run_id: str) -> list[dict]:
@@ -55,6 +62,7 @@ def rounds(store, run_id: str) -> list[dict]:
         r = dict(r)
         r["params"] = json.loads(r["params"]) if r["params"] else {}
         r["predicted_blast_radius"] = json.loads(r["predicted_blast_radius"]) if r["predicted_blast_radius"] else []
+        r["preflight"] = json.loads(r["preflight"]) if r.get("preflight") else None
         out.append(r)
     return out
 

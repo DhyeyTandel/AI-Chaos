@@ -44,14 +44,39 @@ def get(store, exp_id) -> dict:
     r["params"] = json.loads(r["params"])
     r["impact"] = json.loads(r["impact"]) if r["impact"] else None
     r["safety_decisions"] = json.loads(r["safety_decisions"]) if r["safety_decisions"] else []
+    r["preflight_review"] = json.loads(r["preflight_review"]) if r["preflight_review"] else None
     return r
 
 
-async def run_experiment(store, driver, cfg, fault, target, duration, params=None, log=print, stop: asyncio.Event | None = None, context=None, chat=None):
+def _record_veto(store, fault, target, params, review):
+    exp_id = new_id()
+    now = time.time()
+    with store.conn:
+        store.conn.execute(
+            "INSERT INTO experiments (id, fault, target, params, state, created_at, finished_at, abort_reason, preflight_review)"
+            " VALUES (?, ?, ?, ?, 'VETOED', ?, ?, ?, ?)",
+            (exp_id, fault, target, json.dumps(params), now, now, f"safety review veto: {review['reason']}", json.dumps(review)),
+        )
+    return exp_id
+
+
+async def run_experiment(
+    store, driver, cfg, fault, target, duration, params=None, log=print, stop: asyncio.Event | None = None, context=None, chat=None,
+    review=None, auto_review=False, graph=None, tier=None,
+):
     params = faults.validate(cfg, fault, target, duration, params or {})
     base = bl.latest(store)
     if base is None:
         raise faults.ValidationError("no baseline; run `faultline baseline` first")
+    if auto_review and review is None:
+        review = safety.preflight_review(cfg, store, base, fault, target, duration, params, tier, context, graph, chat)
+        if review:
+            log(f"Safety review: {safety.describe_review(review)}")
+        if review and review["decision"] == "veto":
+            return get(store, _record_veto(store, fault, target, params, review))
+        if review and review["decision"] == "reduce":
+            duration = review["final"]["duration_s"]
+            params = faults.validate(cfg, fault, target, duration, review["final"]["params"])
     thresholds = base["thresholds"]
     stop = stop or asyncio.Event()
     db_path = store.path
@@ -60,8 +85,9 @@ async def run_experiment(store, driver, cfg, fault, target, duration, params=Non
     OWN.add(exp_id)
     with store.conn:
         store.conn.execute(
-            "INSERT INTO experiments (id, fault, target, params, state, created_at) VALUES (?, ?, ?, ?, 'PREFLIGHT', ?)",
-            (exp_id, fault, target, json.dumps(params), time.time()),
+            "INSERT INTO experiments (id, fault, target, params, state, created_at, preflight_review)"
+            " VALUES (?, ?, ?, ?, 'PREFLIGHT', ?, ?)",
+            (exp_id, fault, target, json.dumps(params), time.time(), json.dumps(review) if review else None),
         )
     sp = stop_path()
     sp.unlink(missing_ok=True)

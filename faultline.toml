@@ -49,6 +49,7 @@ enabled = true            # advisory LLM check during OBSERVING; it can only abo
 interval_s = 10           # period between checks
 first_check_s = 5         # first check this long after injection
 timeout_s = 8             # a check slower than this is ignored (watchdog verdict stands)
+review = true             # pre-flight review before injection: approve, reduce (only lower) or veto; failure approves
 
 [reaper]
 interval_s = 2.0          # reaper loop period
@@ -91,6 +92,12 @@ delay_ms = [50, 300]      # delay intensity menu
 loss_pct = [10]           # packet-loss intensity menu (with 1 ms delay)
 exclude = []              # extra targets the planner never proposes (allowlist is [safety].allow)
 history = 10              # past experiments read for the recent_result component
+
+[planner.memory]
+# cross-run memory: the lowest intensity per (target, fault kind) aborted by the watchdog or safety agent is a known limit;
+# candidates at or above it are not proposed. Aborts by operator, preflight, inject or system are ignored.
+enabled = true
+lookback_days = 7
 
 [planner.weights]
 # score = sum(weight * component); components are 0..1 except recent_result (-1..1)

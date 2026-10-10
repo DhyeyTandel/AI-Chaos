@@ -15,7 +15,7 @@ flowchart LR
     CLI[Controller CLI<br/>map, baseline, run, report]
     PRB[Prober<br/>4 journeys]
     WD[Watchdog 1 s]
-    SA[Safety agent<br/>advisory, in progress]
+    SA[Safety agent<br/>pre-flight review, live advisory]
     INJ[Injector + ledger]
     RP[Reaper<br/>always on]
     AG[LangGraph agents<br/>planner, validator, analyst, fixer]
@@ -51,28 +51,34 @@ flowchart LR
 ```mermaid
 flowchart TD
   M[Dependency map<br/>Compose + Jaeger traces] --> C[Candidate faults<br/>allowed targets x fault types]
-  C --> S[Deterministic score<br/>fan-in, journeys, stateful,<br/>untested, recent results, severity]
+  C --> ME[Cross-run memory<br/>drop candidates at or above<br/>a known abort intensity]
+  ME --> S[Deterministic score<br/>fan-in, journeys, stateful,<br/>untested, recent results, severity]
   S --> T[Top 8, filtered by current risk tier<br/>and excluded targets]
   T -->|Groq available| L[Planner LLM ranks with reason,<br/>hypothesis, predicted blast radius]
   T -->|no key, error, budget hit| F[Fallback: deterministic order]
   L --> V[Validator]
   F --> V
   V -->|reject: try next candidate| V
-  V -->|ok| X[Execute under safety layers]
+  V -->|ok| PR[Pre-flight safety review<br/>approve, reduce, veto]
+  PR -->|veto: next candidate| V
+  PR -->|approve or reduce| X[Execute under safety layers]
   X --> R[Record outcome, recovery, climb decision]
   R -->|survived 2 at tier: climb| M
   R -->|abort: exclude target| M
+  R -->|abort by watchdog or safety agent| ME
   R --> A[Analyst LLM: ranked weaknesses<br/>with evidence]
   A --> FX[Fixer LLM: proposed fixes,<br/>validated Compose overrides]
   A -.fallback.-> AF[Penalty-ranked weaknesses]
 ```
 
-1. **Score.** Each candidate gets a weighted sum of fan-in, share of journeys whose path includes the target, stateful flag, how untested it is, recent results of neighbours, and fault severity. Weights are in `faultline.toml`.
-2. **LLM rank.** The planner model (`openai/gpt-oss-120b`, reasoning effort low) re-ranks the top 8 and gives each a reason. It also states a hypothesis and a predicted blast radius, which the analyst later compares with what was measured (this is how hidden dependencies are detected).
-3. **Validate.** The validator applies the same code checks that guard manual runs (allowlist, caps) and rejects the pick if any ledger fault is still active. On rejection the next ranked candidate is tried, up to a configured limit.
-4. **Risk ladder.** A run starts at tier 1 and climbs one tier after 2 survived experiments. Tier 1: delays up to 50 ms, crashes of services no journey needs. Tier 2: 300 ms delay, 10 % loss, partial-impact crashes. Tier 3: crashes of critical or stateful services, including flagd. An aborted experiment excludes its target for the rest of the run.
-5. **Analyze and fix.** The analyst ranks weaknesses using measured impact, breadth and recovery; the fixer proposes a fix for each. Proposed Compose overrides are checked (only restart, healthcheck and deploy keys are accepted) and are never applied.
-6. **Fallback path.** Every agent has a deterministic fallback used when there is no key, the call fails or times out, the response does not parse, or the daily budget is spent. The run result records whether each step used the LLM or the fallback.
+1. **Remember.** Before scoring, candidates are filtered by cross-run memory. From the experiments table (all runs and standalone experiments, last `lookback_days`), the lowest intensity per (target, fault kind) that the watchdog or safety agent aborted is a known limit (a crash counts as maximum intensity; delay uses `delay_ms`, loss uses `loss_pct`). Candidates at or above it are excluded and the reason is recorded. Aborts by the operator, preflight, inject or system are ignored. The limits are also given to the planner prompt, so its reasons can cite them.
+2. **Score.** Each candidate gets a weighted sum of fan-in, share of journeys whose path includes the target, stateful flag, how untested it is, recent results of neighbours, and fault severity. Weights are in `faultline.toml`.
+3. **LLM rank.** The planner model (`openai/gpt-oss-120b`, reasoning effort low) re-ranks the top 8 and gives each a reason. It also states a hypothesis and a predicted blast radius, which the analyst later compares with what was measured (this is how hidden dependencies are detected).
+4. **Validate.** The validator applies the same code checks that guard manual runs (allowlist, caps) and rejects the pick if any ledger fault is still active. On rejection the next ranked candidate is tried, up to a configured limit.
+5. **Pre-flight review.** After validation and before injection, in both `run` and `experiment`, the safety agent (`openai/gpt-oss-20b`, reasoning effort low, response cache allowed) gets the candidate, tier, hypothesis and predicted blast radius, baseline and thresholds, the learned limits and the last outcomes on the target and its neighbours. It answers approve, reduce or veto. A reduction may only lower `delay_ms`, `loss_pct` or the duration (a crash can only get a shorter duration, at least 10 s); it is re-validated, and an invalid or raising reduction becomes a veto. A veto skips the experiment and the run takes the next ranked candidate; it counts as a planner attempt, not as an abort, and does not exclude the target. If the review fails, times out or has no key, it approves (recorded as a fallback) and the validator and watchdog still apply. The decision, reason and original versus final parameters are stored with the experiment and the run round.
+6. **Risk ladder.** A run starts at tier 1 and climbs one tier after 2 survived experiments. Tier 1: delays up to 50 ms, crashes of services no journey needs. Tier 2: 300 ms delay, 10 % loss, partial-impact crashes. Tier 3: crashes of critical or stateful services, including flagd. An aborted experiment excludes its target for the rest of the run.
+7. **Analyze and fix.** The analyst ranks weaknesses using measured impact, breadth and recovery; the fixer proposes a fix for each. Proposed Compose overrides are checked (only restart, healthcheck and deploy keys are accepted) and are never applied.
+8. **Fallback path.** Every agent has a deterministic fallback used when there is no key, the call fails or times out, the response does not parse, or the daily budget is spent. The run result records whether each step used the LLM or the fallback.
 
 Budget control: a shared request limiter, a per-model token bucket (8000 tokens/min), a per-model daily budget (180,000 tokens), and a 6 h response cache. `agents usage` and `agents trace` expose all of it.
 
@@ -88,7 +94,8 @@ Layers are independent: a failure of one (including the LLM) does not remove the
 | Allowlist and caps | Wrong targets, oversized faults | Unit tests (`tests/test_faults.py`) |
 | Write-ahead ledger | Controller dies after or during apply | Unit tests (`tests/test_ledger.py`); used by the kill switch and reaper |
 | Watchdog (1 s) | Journey error rate or p95 beyond baseline-derived thresholds; loss of observability (no samples for 5 s) | Live: cart crash aborted at p95 3007 ms |
-| Safety agent (in progress) | Harm outside the predicted blast radius or a worsening trend, checked about every 10 s | Advisory only; can abort, cannot continue past a watchdog abort; slow or failed checks are ignored |
+| Pre-flight safety review | An experiment that looks likely to breach limits or repeat a known abort, before anything is injected | Can only approve, lower intensity or veto; a failed review approves and the layers below still apply |
+| Safety agent (live) | Harm outside the predicted blast radius or a worsening trend, checked about every 10 s | Advisory only; can abort, cannot continue past a watchdog abort; slow or failed checks are ignored |
 | Kill switch | Operator wants everything undone now | Live: `faultline stop` plus STOP sentinel |
 | Reaper | Controller crash or hang; expired faults | Live: reverted stale-heartbeat faults (measured 13 s) |
 | Self-expiring netem sidecar | Controller and reaper both dead | Live: rule removed at TTL with both stopped |

@@ -22,8 +22,9 @@ class Script:
         self.calls = []
         self.n = 0
 
-    def __call__(self, c, context=None):
+    def __call__(self, c, context=None, review=None):
         self.calls.append(c)
+        self.reviews = [*getattr(self, 'reviews', []), review]
         self.n += 1
         state, reason = self.outcomes.get(self.n, ("COMPLETED", None))
         return {"id": f"exp-{self.n}", "state": state, "abort_reason": reason, "recovery_seconds": None if reason else 2.5}
@@ -105,7 +106,7 @@ def test_kill_switch_ends_whole_run(rcfg, store, tmp_path):
     sentinel = tmp_path / "STOP"
     control = runs.RunControl(path=sentinel)
 
-    def runner(c, context=None):
+    def runner(c, context=None, review=None):
         sentinel.write_text("1")
         return {"id": "exp-x", "state": "ABORTED", "abort_reason": "kill switch (STOP file)", "recovery_seconds": None}
 
@@ -160,7 +161,7 @@ def test_planner_gets_only_tier_eligible_candidates(rcfg, store):
     tier_of = {c.id: c.tier for c in planner.generate_candidates(rcfg, gmap())}
     script = Script()
     go(rcfg, store, 3, script, chat=chat)
-    firsts = [u for i, u in enumerate(chat.users) if i % 2 == 0]
+    firsts = list(dict.fromkeys(u for u in chat.users if "Strategy: survivable first" in u))
     assert len(firsts) == 3
     max_tier = [1, 1, 2]
     tested = []

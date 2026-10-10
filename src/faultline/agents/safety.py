@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -5,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
-from .. import analyzer, llm
+from .. import analyzer, faults, llm, memory
 from ..baseline import done_ts
 from ..stats import percentile
 from ..store import Store
@@ -200,3 +201,197 @@ def describe(checks: list[dict]) -> str:
         return "-"
     s = summarize(checks)
     return f"{s['checks']} checks: {s['continue']} continue, {s['abort']} abort, {s['ignored']} ignored"
+
+
+class ReviewOut(BaseModel):
+    decision: Literal["approve", "reduce", "veto"]
+    reason: str
+    reduced_params: dict | None = None
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _lower(cls, v):
+        return str(v).strip().lower()
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _trim(cls, v):
+        return analyzer.clean(str(v))[:REASON_MAX]
+
+
+REVIEW_SYSTEM = (
+    "You are the pre-flight safety reviewer of a chaos engineering tool that is about to inject one fault into a microservice demo shop. "
+    "A deterministic validator already accepted the plan and a watchdog will abort a breach, but you review before anything is injected "
+    "and may only make the experiment safer or stop it. You get the planned fault, its tier (1 light to 3 critical), the hypothesis "
+    "with its predicted blast radius, the baseline and abort limits of each user journey, known limits (intensities earlier runs "
+    "aborted), and recent outcomes on this target and its neighbours. Answer approve when the experiment looks survivable. "
+    "Answer reduce when a lower intensity is clearly safer and still informative: you may only lower delay_ms, loss_pct or duration_s "
+    "(duration at least 10 s); a crash can only get a shorter duration. Answer veto only when the experiment is very likely to breach "
+    "the limits or repeats a known abort. Reply with one JSON object and nothing else: "
+    '{"decision":"approve|reduce|veto","reason":"<=200 chars, cite numbers from the input","reduced_params":{"delay_ms":100}}. '
+    "Give reduced_params only for reduce, with only the keys you lower. Use plain ASCII punctuation, no em dashes."
+)
+MIN_DURATION_S = 10
+PARAM_KEYS = ("delay_ms", "jitter_ms", "loss_pct")
+REDUCIBLE = {"crash": ("duration_s",), "delay": ("delay_ms", "duration_s"), "loss": ("loss_pct", "duration_s")}
+RECENT = 5
+
+
+class Rejected(ValueError):
+    pass
+
+
+def apply_reduction(cfg, fault: str, target: str, duration: float, params: dict, reduced) -> tuple[dict, float]:
+    """Validated (params, duration) after a proposed reduction. Raises Rejected unless every changed value is lower."""
+    if not isinstance(reduced, dict) or not reduced:
+        raise Rejected("reduce without reduced_params")
+    kind = analyzer.fault_kind(fault, params)
+    new, new_dur, lowered = dict(params), float(duration), False
+    for key, raw in reduced.items():
+        if key not in REDUCIBLE[kind]:
+            raise Rejected(f"{key} may not change for {kind}")
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            raise Rejected(f"{key} is not a number")
+        cur = float(duration) if key == "duration_s" else float(params.get(key, 0))
+        if v > cur:
+            raise Rejected(f"{key} {v:g} raises {cur:g}")
+        if v == cur:
+            continue
+        if key == "duration_s" and v < MIN_DURATION_S:
+            raise Rejected(f"duration below {MIN_DURATION_S} s")
+        if key == "delay_ms" and v < 1 or key == "loss_pct" and v <= 0:
+            raise Rejected(f"{key} {v:g} out of range")
+        lowered = True
+        if key == "duration_s":
+            new_dur = v
+        else:
+            new[key] = v
+    if not lowered:
+        raise Rejected("no value was lowered")
+    try:
+        out = faults.validate(cfg, fault, target, new_dur, new)
+    except faults.ValidationError as e:
+        raise Rejected(str(e))
+    return {k: out[k] for k in PARAM_KEYS if k in out}, new_dur
+
+
+def _norm(cfg, fault, target, duration, params) -> dict:
+    out = faults.validate(cfg, fault, target, duration, params)
+    return {k: out[k] for k in PARAM_KEYS if k in out}
+
+
+def active(cfg) -> bool:
+    return bool(cfg.safety_agent.enabled and cfg.safety_agent.review)
+
+
+def build_review_input(cfg, store, base: dict, fault, target, duration, params, tier, context, graph, limits) -> str:
+    from .planner import neighbours
+
+    context = context or {}
+    nb = neighbours(graph).get(target, set()) if graph else set()
+    rows = store.conn.execute(
+        "SELECT fault, target, params, state, abort_source, abort_reason FROM experiments WHERE state != 'VETOED' ORDER BY created_at DESC LIMIT 60"
+    )
+    recent = []
+    for r in rows:
+        if r["target"] != target and r["target"] not in nb:
+            continue
+        label = analyzer.fault_label(r["fault"], json.loads(r["params"]))
+        out = r["state"] + (f" by {r['abort_source']}" if r["state"] == "ABORTED" and r["abort_source"] else "")
+        recent.append(f"{r['target']}{' (neighbour)' if r['target'] != target else ''} {label} -> {out}")
+        if len(recent) == RECENT:
+            break
+    lines = []
+    for j, th in base["thresholds"].items():
+        b = base["journeys"][j]
+        lines.append(
+            f"{j}: baseline err {_pct(b['error_rate'])} p95 {_ms(b['p95_ms'])}; abort limits err {_pct(th['error_rate_max'])} p95 {_ms(th['p95_max_ms'])}"
+        )
+    kind = analyzer.fault_kind(fault, params)
+    mine = [x for x in limits if x["target"] == target]
+    known = memory.prompt_text(mine + [x for x in limits if x["target"] != target]) if limits else "none"
+    return (
+        f"Planned fault: {analyzer.fault_label(fault, params)} ({kind}) on {target}, duration {duration:g}s, tier {tier if tier else 'n/a'}\n"
+        f"Hypothesis: {context.get('hypothesis') or 'none (manual experiment)'}\n"
+        f"Predicted blast radius: {', '.join((context.get('blast_radius') or [])[:12]) or 'none'}\n"
+        f"Predicted journeys: {', '.join(context.get('predicted_journeys') or []) or 'none'}\n"
+        + "\n".join(lines)
+        + f"\nKnown limits (lowest aborted intensity): {known}\n"
+        + f"Recent outcomes on {target} and its neighbours: {'; '.join(recent) or 'none'}"
+    )
+
+
+def _view(fault, params, duration) -> dict:
+    return {"params": dict(params), "duration_s": float(duration)}
+
+
+def preflight_review(cfg, store, base, fault, target, duration, params, tier=None, context=None, graph=None, chat=None) -> dict | None:
+    """Review before injection. Returns None when disabled. Never raises; failure approves (the validator and watchdog still apply)."""
+    if not active(cfg) or base is None:
+        return None
+    try:
+        norm = _norm(cfg, fault, target, duration, params)
+    except faults.ValidationError:
+        norm = dict(params)
+    original = _view(fault, norm, duration)
+    rec = {
+        "decision": "approve", "reason": "", "fallback": 1, "error": None, "original": original, "final": original,
+        "latency_ms": 0, "tokens": 0, "cached": False,
+    }
+    try:
+        limits = memory.known_limits(cfg, store)
+        user = build_review_input(cfg, store, base, fault, target, duration, norm, tier, context, graph, limits)
+        out, meta = llm.call_structured(
+            "safety", cfg.llm.safety_model, ReviewOut, REVIEW_SYSTEM, user, timeout_s=cfg.safety_agent.timeout_s, store=store,
+            input_summary=f"preflight {analyzer.fault_label(fault, norm)} {target}", chat=chat, cache=True,
+        )
+    except Exception as e:
+        rec["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        rec["reason"] = "review unavailable, approved by fallback"
+        return rec
+    rec.update(latency_ms=round(meta["latency_ms"]), tokens=meta["prompt_tokens"] + meta["completion_tokens"], cached=meta["cached"], error=meta["error"])
+    if out is None:
+        rec["reason"] = f"review unavailable ({meta['error']}), approved by fallback"
+        return rec
+    rec.update(fallback=0, reason=out.reason, decision=out.decision)
+    if out.decision == "reduce":
+        try:
+            fparams, fdur = apply_reduction(cfg, fault, target, duration, norm, out.reduced_params)
+            rec["final"] = _view(fault, fparams, fdur)
+        except Rejected as e:
+            rec.update(decision="veto", final=None, reason=analyzer.clean(f"reduction rejected ({e}); {out.reason}")[:REASON_MAX])
+    elif out.decision == "veto":
+        rec["final"] = None
+    return rec
+
+
+def _changes(rec: dict) -> str:
+    a, b = rec["original"], rec["final"]
+    parts = []
+    for k, unit in (("delay_ms", "ms"), ("loss_pct", "%")):
+        if a["params"].get(k) != b["params"].get(k) and k in a["params"]:
+            parts.append(f"{k.split('_')[0]} {a['params'][k]:g} -> {b['params'][k]:g} {unit}")
+    if a["duration_s"] != b["duration_s"]:
+        parts.append(f"duration {a['duration_s']:g} -> {b['duration_s']:g} s")
+    return ", ".join(parts)
+
+
+def describe_review(rec: dict | None) -> str:
+    if not rec:
+        return "-"
+    d = rec["decision"]
+    if rec.get("fallback"):
+        return f"approved (fallback: {rec.get('error') or 'unavailable'})"
+    if d == "reduce":
+        return f"reduced {_changes(rec)}: {rec['reason']}"
+    return f"{'vetoed' if d == 'veto' else 'approved'}: {rec['reason']}"
+
+
+def summarize_reviews(recs: list[dict]) -> dict:
+    return {
+        "reviews": len(recs), "approve": sum(1 for r in recs if r["decision"] == "approve" and not r.get("fallback")),
+        "reduce": sum(1 for r in recs if r["decision"] == "reduce"), "veto": sum(1 for r in recs if r["decision"] == "veto"),
+        "fallback": sum(1 for r in recs if r.get("fallback")),
+    }
