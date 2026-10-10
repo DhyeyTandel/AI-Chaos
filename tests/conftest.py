@@ -4,6 +4,15 @@ from faultline.config import load_config
 from faultline.store import Store
 
 
+@pytest.fixture(autouse=True)
+def fresh_tpm_limiters():
+    from faultline import llm
+
+    llm.reset_tpm_limiters()
+    yield
+    llm.reset_tpm_limiters()
+
+
 @pytest.fixture
 def cfg():
     return load_config(path="/nonexistent")

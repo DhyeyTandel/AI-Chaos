@@ -55,6 +55,7 @@ class PlanResult(BaseModel):
     fallback_reason: str | None = None
     model: str
     latency_ms: float = 0.0
+    cached: bool = False
 
 
 def load_map(cfg, overrides_path, out_path) -> dict:
@@ -292,7 +293,7 @@ def plan(cfg, graph: dict, store, top_k: int | None = None, chat=None) -> PlanRe
         hyp = out.hypothesis or template_hypothesis(graph, first)
     return PlanResult(
         ranked=ordered, hypothesis=hyp, blast_radius=blast, fallback=fallback, fallback_reason=meta["error"] if fallback else None,
-        model=model, latency_ms=meta["latency_ms"],
+        model=model, latency_ms=meta["latency_ms"], cached=meta["cached"],
     )
 
 

@@ -70,9 +70,33 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     output_json TEXT,
     latency_ms REAL,
     fallback INTEGER NOT NULL DEFAULT 0,
-    error TEXT
+    error TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS llm_usage (
+    day TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, model)
+);
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+    key TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    output_json TEXT NOT NULL
 );
 """
+
+TRACE_MIGRATIONS = {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"}
+
+
+def today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def default_db_path() -> str:
@@ -89,6 +113,17 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(agent_trace)")}
+        for col, typ in TRACE_MIGRATIONS.items():
+            if col not in have:
+                try:
+                    self.conn.execute(f"ALTER TABLE agent_trace ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass
+        self.conn.commit()
 
     def insert_sample(self, ts_wall, ts_mono, journey, ok, status, latency_ms, error=None):
         self.insert_many([(ts_wall, ts_mono, journey, ok, status, latency_ms, error)])
@@ -116,13 +151,14 @@ class Store:
         sql += " ORDER BY ts_wall, id"
         return [dict(r) for r in self.conn.execute(sql, args)]
 
-    def add_trace(self, agent, model, input_summary, output_json, latency_ms, fallback, error=None):
+    def add_trace(self, agent, model, input_summary, output_json, latency_ms, fallback, error=None, prompt_tokens=None, completion_tokens=None):
         try:
             with self.conn:
                 self.conn.execute(
-                    "INSERT INTO agent_trace (ts, agent, model, input_summary, output_json, latency_ms, fallback, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (time.time(), agent, model, input_summary, output_json, latency_ms, int(bool(fallback)), error),
+                    "INSERT INTO agent_trace (ts, agent, model, input_summary, output_json, latency_ms, fallback, error,"
+                    " prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (time.time(), agent, model, input_summary, output_json, latency_ms, int(bool(fallback)), error,
+                     prompt_tokens, completion_tokens),
                 )
         except sqlite3.Error:
             pass
@@ -130,6 +166,49 @@ class Store:
     def traces(self, limit: int = 20):
         rows = self.conn.execute("SELECT * FROM agent_trace ORDER BY id DESC LIMIT ?", (limit,))
         return [dict(r) for r in rows][::-1]
+
+    def add_usage(self, model, requests, prompt_tokens, completion_tokens):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO llm_usage (day, model, requests, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(day, model) DO UPDATE SET requests = requests + excluded.requests,"
+                    " prompt_tokens = prompt_tokens + excluded.prompt_tokens,"
+                    " completion_tokens = completion_tokens + excluded.completion_tokens",
+                    (today(), model, requests, prompt_tokens, completion_tokens),
+                )
+        except sqlite3.Error:
+            pass
+
+    def usage_today(self, model: str) -> dict:
+        r = self.conn.execute(
+            "SELECT requests, prompt_tokens, completion_tokens FROM llm_usage WHERE day = ? AND model = ?", (today(), model)
+        ).fetchone()
+        req, pt, ct = (r["requests"], r["prompt_tokens"], r["completion_tokens"]) if r else (0, 0, 0)
+        return {"requests": req, "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+    def usage_all_today(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM llm_usage WHERE day = ? ORDER BY model", (today(),))
+        return [dict(r) for r in rows]
+
+    def cache_get(self, key: str, ttl_s: float):
+        r = self.conn.execute("SELECT output_json FROM llm_cache WHERE key = ? AND created_at >= ?", (key, time.time() - ttl_s)).fetchone()
+        return r["output_json"] if r else None
+
+    def cache_put(self, key: str, model: str, output_json: str):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO llm_cache (key, model, created_at, output_json) VALUES (?, ?, ?, ?)",
+                    (key, model, time.time(), output_json),
+                )
+        except sqlite3.Error:
+            pass
+
+    def cache_hits_today(self) -> int:
+        start = time.time() // 86400 * 86400
+        r = self.conn.execute("SELECT COUNT(*) AS n FROM agent_trace WHERE error = 'cache' AND ts >= ?", (start,)).fetchone()
+        return r["n"]
 
     def close(self):
         self.conn.close()

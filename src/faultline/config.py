@@ -40,6 +40,11 @@ DEFAULTS = {
         "safety_model": "openai/gpt-oss-20b",
         "rate_per_min": 25,
         "timeout_s": 20,
+        "tpm_per_model": 8000,
+        "daily_token_budget": 180000,
+        "cache_ttl_s": 21600,
+        "reasoning_effort": {"planner": "low", "analyst": "medium", "fixer": "medium", "safety": "low"},
+        "max_tokens": {"planner": 1500, "analyst": 1500, "fixer": 2000, "safety": 800},
     },
     "planner": {
         "top_k": 8,

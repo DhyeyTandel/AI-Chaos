@@ -22,7 +22,7 @@ from .store import Store, default_db_path
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 agents_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Agent tools.")
 app.add_typer(agents_app, name="agents")
-console = Console()
+console = Console(width=int(os.environ["COLUMNS"]) if os.environ.get("COLUMNS", "").isdigit() else None)
 
 DEMO_SAFE = ("quote", "delay", 150)
 DEMO_BREACH = ("product-catalog", "crash", 30)
@@ -383,20 +383,39 @@ def plan(top: int = typer.Option(None, "--top", min=1, help="Candidates ranked a
     if res.fallback:
         console.print(f"planner: FALLBACK ({res.fallback_reason})", markup=False)
     else:
-        console.print(f"planner: groq {res.model} ({res.latency_ms:.0f} ms)", markup=False)
+        console.print(f"planner: groq {res.model} ({res.latency_ms:.0f} ms{', cached' if res.cached else ''})", markup=False)
     raise typer.Exit(0 if pick else 1)
 
 
 @agents_app.command("trace")
 def agents_trace(limit: int = typer.Option(20, "--limit", "-n")):
     """Show recent agent trace rows."""
-    t = Table("id", "time", "agent", "model", "ms", "fb", "input", "output", "error")
-    for col in (6, 7, 8):
+    t = Table("id", "time", "agent", "model", "ms", "tok", "fb", "input", "output", "error")
+    for col in (7, 8, 9):
         t.columns[col].overflow = "fold"
     for r in Store().traces(limit):
         t.add_row(
             str(r["id"]), time.strftime("%H:%M:%S", time.localtime(r["ts"])), r["agent"], r["model"] or "-",
-            _fmt(r["latency_ms"]), "yes" if r["fallback"] else "no", (r["input_summary"] or "-")[:60],
+            _fmt(r["latency_ms"]), f"{r['prompt_tokens']}/{r['completion_tokens']}" if r["prompt_tokens"] is not None else "-",
+            "yes" if r["fallback"] else "no", (r["input_summary"] or "-")[:60],
             (r["output_json"] or "-")[:70], r["error"] or "-",
         )
     console.print(t)
+
+
+@agents_app.command("usage")
+def agents_usage():
+    """Today's per-model LLM requests and tokens against the daily budget, plus cache hits."""
+    cfg = load_config()
+    store = Store()
+    used = {r["model"]: r for r in store.usage_all_today()}
+    models = sorted({cfg.llm.planner_model, cfg.llm.analyst_model, cfg.llm.fixer_model, cfg.llm.safety_model} | set(used))
+    t = Table("model", "requests", "prompt", "completion", "total", "budget", "used %")
+    for m in models:
+        u = store.usage_today(m)
+        t.add_row(
+            m, str(u["requests"]), str(u["prompt_tokens"]), str(u["completion_tokens"]), str(u["total_tokens"]),
+            str(cfg.llm.daily_token_budget), f"{100 * u['total_tokens'] / cfg.llm.daily_token_budget:.1f}",
+        )
+    console.print(t)
+    console.print(f"cache hits today: {store.cache_hits_today()}", markup=False)

@@ -59,6 +59,21 @@ fixer_model = "openai/gpt-oss-120b"
 safety_model = "openai/gpt-oss-20b"
 rate_per_min = 25         # shared token bucket across all agents
 timeout_s = 20            # per LLM request
+tpm_per_model = 8000      # tokens per minute bucket per model (Groq free tier)
+daily_token_budget = 180000   # per model per UTC day; calls fall back once reached
+cache_ttl_s = 21600       # response cache lifetime (6 h); FAULTLINE_LLM_CACHE=0 disables it
+
+[llm.reasoning_effort]    # gpt-oss only: low | medium | high
+planner = "low"
+analyst = "medium"
+fixer = "medium"
+safety = "low"
+
+[llm.max_tokens]          # output cap per call, includes hidden reasoning tokens
+planner = 1500
+analyst = 1500
+fixer = 2000
+safety = 800
 
 [planner]
 top_k = 8                 # candidates sent to the LLM
