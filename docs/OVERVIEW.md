@@ -33,6 +33,10 @@ Out of scope (Bosch rules): real or production systems, anything outside my sand
 | LLM | DECIDED | Groq free API (open-weight Llama models) |
 | Network faults | DECIDED | `tc netem` sidecar |
 | Stand-out ideas | DECIDED | Keep all 8 (section 9) |
+| Agents | DECIDED | Multi-agent inside the product: Planner, Safety, Analyst, Fixer, orchestrated as a LangGraph pipeline (section 15) |
+| Safety agent | DECIDED | Live control during experiments, layered on top of the deterministic watchdog (can only make things safer) |
+| Fixer | DECIDED | Auto-applies a validated compose override, re-runs the experiment, reports before/after score |
+| Dev environment | DECIDED | GitHub Codespaces (4-core / 16 GB); Mac as backup |
 | Scope | DECIDED | Day-1 minimum, Day-2 minimum, all three stretch goals |
 | Project name | PENDING | On hold |
 | Controller placement | DECIDED | Container with Docker socket mounted (section 5) |
@@ -402,3 +406,49 @@ faultline demo      # end to end
 | No Windows machine to test on | Codespaces covers Linux; Windows-specific risks handled by design (section 5) |
 | Public repo leaks the Groq key | Env / Codespaces secret only, `.env` gitignored, scan before submission |
 | Scope too large for solo | Minimum first, each stretch goal an independent layer |
+
+---
+
+## 15. Multi-agent design (confirmed)
+
+Four LLM agents, orchestrated as a LangGraph `StateGraph` pipeline. Everything safety-critical stays deterministic underneath.
+
+```
+ map + baseline (deterministic)
+        |
+   [Planner agent]  ranked candidates, reason each, hypothesis, predicted blast radius
+        |
+   validator (deterministic guardrails)
+        |
+   inject (deterministic)
+        |
+   observe loop: every 1s  -> deterministic watchdog (hard floor)
+                 every ~10s -> [Safety agent]: continue / abort + reason
+        |
+   revert + recovery (deterministic)
+        |
+   [Analyst agent]  impact, actual vs predicted blast radius, verdict, severity rank
+        |
+   [Fixer agent]    concrete fix per finding -> validated compose override -> re-run -> before/after
+        |
+   next round (adaptive) or report
+```
+
+**Safety agent rules**
+- Can only make things safer: abort early or shorten. Never cancels a watchdog abort, raises thresholds, or extends duration.
+- Fixed cadence (~10s), not every tick, to fit free-tier rate limits.
+- Timeout, 429 or invalid output = watchdog verdict stands, logged. Never treated as "continue".
+
+**All agents**
+- Typed Pydantic outputs; one retry on invalid output, then that agent's deterministic fallback.
+- No key: Planner = deterministic ranker, Safety = watchdog only, Analyst and Fixer = rule-based templates. Report states which agents ran in fallback.
+- Shared rate-limit token bucket (~25 req/min) with Safety prioritised.
+- Agent trace (input summary, output, latency, fallback flag) stored in SQLite, shown in report and dashboard.
+- Models: Planner, Analyst, Fixer on `llama-3.3-70b-versatile`; Safety on `llama-3.1-8b-instant`. Client: `langchain-groq`.
+
+**Fixer auto-apply guardrails**
+- Override limited to allowed keys (restart policy, healthcheck, resource limits).
+- Validated with `docker compose config` before applying.
+- Applied fix is recorded in the ledger so it can be rolled back; original state restorable with one command.
+
+**Timing:** agents and LangGraph land on Day 2 phase A. Day-1 work is unchanged.
