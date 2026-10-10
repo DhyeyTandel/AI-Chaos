@@ -78,6 +78,10 @@ DEFAULTS = {
         "max_per_plan": 3,
         "tier": 3,
     },
+    "fix": {
+        "max_memory_mb": 512, "max_cpus": 2.0, "keep_if_improved": True, "improve_min_penalty": 5.0,
+        "settle_s": 10, "stable_timeout_s": 60, "rerun_max": 2,
+    },
     "run": {"climb_after": 2, "cooldown_s": 10, "settle_wait_s": 60},
     "score": {
         "impact_weight": 0.5,

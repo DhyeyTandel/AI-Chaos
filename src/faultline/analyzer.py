@@ -181,19 +181,30 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
     }
 
 
-def load_experiments(store, run_id: str, rounds: list[dict], until: float | None, history_limit: int = 50) -> list[tuple[dict, dict | None]]:
-    def fetch(where, args):
-        out = []
-        for r in store.conn.execute(f"SELECT * FROM experiments WHERE {where}", args):
-            r = dict(r)
-            r["params"] = json.loads(r["params"])
-            r["impact"] = json.loads(r["impact"]) if r["impact"] else None
-            r["safety_decisions"] = json.loads(r["safety_decisions"]) if r.get("safety_decisions") else []
-            r["preflight_review"] = json.loads(r["preflight_review"]) if r.get("preflight_review") else None
-            out.append(r)
-        return out
+def after_fix_ids(store) -> set[str]:
+    """Experiments re-run after an applied fix. They are reported as after-fix rows and never mixed into scores or history."""
+    try:
+        rows = store.conn.execute("SELECT after_experiment_ids FROM fixes WHERE after_experiment_ids IS NOT NULL").fetchall()
+    except Exception:
+        return set()
+    return {i for r in rows for i in json.loads(r[0])}
 
-    pairs, ids = [], set()
+
+def fetch_experiments(store, where, args):
+    out = []
+    for r in store.conn.execute(f"SELECT * FROM experiments WHERE {where}", args):
+        r = dict(r)
+        r["params"] = json.loads(r["params"])
+        r["impact"] = json.loads(r["impact"]) if r["impact"] else None
+        r["safety_decisions"] = json.loads(r["safety_decisions"]) if r.get("safety_decisions") else []
+        r["preflight_review"] = json.loads(r["preflight_review"]) if r.get("preflight_review") else None
+        out.append(r)
+    return out
+
+
+def load_experiments(store, run_id: str, rounds: list[dict], until: float | None, history_limit: int = 50) -> list[tuple[dict, dict | None]]:
+    fetch = lambda where, args: fetch_experiments(store, where, args)
+    pairs, ids = [], set(after_fix_ids(store))
     for rnd in rounds:
         rows = fetch("id = ?", (rnd["experiment_id"],)) if rnd.get("experiment_id") else []
         if rows:
@@ -250,8 +261,12 @@ def analyze(cfg, store, graph: dict, run: dict, rounds: list[dict]) -> dict:
     pairs = load_experiments(store, run["run_id"], rounds, run.get("ended_at"))
     analyzed = [analyze_experiment(cfg, e, r, graph, thresholds) for e, r in pairs]
     roll = roll_up(cfg, graph, analyzed)
+    after = {
+        r["id"]: {**analyze_experiment(cfg, r, None, graph, thresholds), "scope": "after_fix"}
+        for i in sorted(after_fix_ids(store)) for r in fetch_experiments(store, "id = ?", (i,))
+    }
     return {
-        "run": run, "experiments": analyzed, "hidden": hidden_dependencies(graph, analyzed),
+        "run": run, "experiments": analyzed, "after_fix": after, "hidden": hidden_dependencies(graph, analyzed),
         "journeys": sorted((graph.get("journeys") or {}).keys()), **roll,
     }
 

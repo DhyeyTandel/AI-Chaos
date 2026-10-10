@@ -55,7 +55,8 @@ class FixerResult(BaseModel):
 
 SYSTEM = (
     "You are the fixer of a chaos engineering tool for a microservice demo shop run with Docker Compose. For each weakness "
-    "propose one concrete, realistic fix. Proposals are never applied automatically. Reply with one JSON object and nothing "
+    "propose one concrete, realistic fix. A config fix that sets a restart policy or raises a memory limit (at most 512M) on exactly one "
+    "service may be applied after operator confirmation and is then re-tested; all other fixes stay proposals. Reply with one JSON object and nothing "
     "else, in this format: "
     '{"fixes":[{"weakness_rank":1,"fix_title":"short","fix_type":"config|code|architecture","steps":"<=500 chars, concrete steps",'
     '"compose_override":"optional YAML","expected_effect":"<=250 chars"}]}. '

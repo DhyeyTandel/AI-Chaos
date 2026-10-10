@@ -237,7 +237,8 @@ REVIEW_SYSTEM = (
     "aborted), and recent outcomes on this target and its neighbours. Answer approve when the experiment looks survivable. "
     "Answer reduce when a lower intensity is clearly safer and still informative: you may only lower delay_ms, loss_pct, users or duration_s "
     "(duration at least 10 s); a crash can only get a shorter duration. Answer veto only when the experiment is very likely to breach "
-    "the limits or repeats a known abort. Reply with one JSON object and nothing else: "
+    "the limits or repeats a known abort. Only outcomes aborted by watchdog or safety_agent are aborts; an experiment stopped by the operator "
+    "is not a failure and says nothing about the limits, and must never be a reason to veto or reduce. Reply with one JSON object and nothing else: "
     '{"decision":"approve|reduce|veto","reason":"<=200 chars, cite numbers from the input","reduced_params":{"delay_ms":100}}. '
     "Give reduced_params only for reduce, with only the keys you lower. Use plain ASCII punctuation, no em dashes."
 )
@@ -246,8 +247,7 @@ REVIEW_COMBO_NOTE = (
     "To reduce, you may lower any part: give reduced_params as "
     '{"duration_s":15,"parts":[{"index":2,"delay_ms":30}]} where index is the part number in the list and each part may only lower its own '
     "delay_ms, loss_pct or users; a crash part cannot be lowered, only the shared duration_s can. "
-    "Only outcomes aborted by watchdog or safety_agent are known aborts; operator aborts, preflight, inject or system aborts say nothing about "
-    "the limits of the faults and must not be a reason to veto. A combination is survivable when each part is mild and the limits are far above the baseline."
+    "A combination is survivable when each part is mild and the limits are far above the baseline."
 )
 MIN_DURATION_S = 10
 PARAM_KEYS = ("delay_ms", "jitter_ms", "loss_pct", "users", "spawn_rate")
@@ -356,6 +356,23 @@ def active(cfg) -> bool:
     return bool(cfg.safety_agent.enabled and cfg.safety_agent.review)
 
 
+OPERATOR_STOPS = ("operator", "kill switch")
+
+
+def outcome_text(r) -> str | None:
+    """Outcome shown to the reviewer. Only watchdog and safety agent aborts are aborts; an operator stop is shown as not a failure;
+    preflight, inject, revert and system aborts say nothing about the target and are left out."""
+    if r["state"] != "ABORTED":
+        return r["state"]
+    source = r["abort_source"] or memory.legacy_source(r["abort_reason"])
+    if source in memory.SAFETY_SOURCES:
+        return f"ABORTED by {source}"
+    reason = r["abort_reason"] or ""
+    if source == "operator" or (source is None and reason.startswith(OPERATOR_STOPS)):
+        return "stopped by operator (not a failure)"
+    return None
+
+
 def build_review_input(cfg, store, base: dict, fault, target, duration, params, tier, context, graph, limits) -> str:
     from .planner import neighbours
 
@@ -371,7 +388,9 @@ def build_review_input(cfg, store, base: dict, fault, target, duration, params, 
         if not rt & (targets | nb):
             continue
         label = analyzer.fault_label(r["fault"], json.loads(r["params"]))
-        out = r["state"] + (f" by {r['abort_source']}" if r["state"] == "ABORTED" and r["abort_source"] else "")
+        out = outcome_text(r)
+        if out is None:
+            continue
         recent.append(f"{r['target']}{'' if rt & targets else ' (neighbour)'} {label} -> {out}")
         if len(recent) == RECENT:
             break

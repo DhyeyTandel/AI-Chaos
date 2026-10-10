@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
@@ -8,10 +10,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import analyzer, combo as combo_mod
+from . import analyzer, combo as combo_mod, fixes as fixes_mod
 from . import baseline as bl
 from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer, runs as runs_mod
-from .agents import planner as planner_mod
+from .agents import analyst as analyst_mod, fixer as fixer_mod, planner as planner_mod
 from .agents import safety as safety_mod
 from . import reaper as reaper_mod
 from .config import load_config
@@ -505,9 +507,14 @@ def _print_run(run: dict, rows: list[dict]):
 def run_cmd(
     rounds: int = typer.Option(3, "--rounds", "-r", min=1, max=8, help="Experiments to run, climbing the risk ladder"),
     make_report: bool = typer.Option(False, "--report", help="Generate the findings report after the run"),
+    fix: bool = typer.Option(False, "--fix", help="After the report, apply and verify the top auto-applicable fix (needs --report and --yes)"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm applying the fix chosen by --fix"),
 ):
     """Autonomous run: plan, validate, execute, record, repeat; start at tier 1 and climb as experiments survive."""
     cfg = load_config()
+    if fix and not (make_report and yes):
+        console.print("rejected: --fix needs --report and --yes (it changes a running container)", markup=False)
+        raise typer.Exit(2)
     store = Store()
     overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
     gmap = planner_mod.load_map(cfg, overrides, _data_dir() / "map.json")
@@ -546,9 +553,14 @@ def run_cmd(
     open_left = Ledger(store).open_entries()
     if open_left:
         console.print(f"LEDGER HAS OPEN ENTRIES: {[e['id'] for e in open_left]}", markup=False)
+    fix_ok = True
     if make_report:
-        _make_report(cfg, store, gmap, run["run_id"])
-    raise typer.Exit(0 if run["rounds_done"] == run["rounds_planned"] and not open_left else 1)
+        state = _make_report(cfg, store, gmap, run["run_id"])
+        if fix and state is not None and not open_left:
+            fix_ok = _fix_flow(cfg, store, gmap, _proposals(cfg, store, state["data"]), run["run_id"], None, True, None)
+            if fix_ok:
+                _make_report(cfg, store, gmap, run["run_id"])
+    raise typer.Exit(0 if run["rounds_done"] == run["rounds_planned"] and not open_left and fix_ok else 1)
 
 
 def _reports_dir() -> Path:
@@ -579,6 +591,213 @@ def report(run_id: str = typer.Option(None, "--run", help="Run id (default: late
     overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
     gmap = planner_mod.load_map(cfg, overrides, _data_dir() / "map.json")
     raise typer.Exit(0 if _make_report(cfg, store, gmap, run_id) else 1)
+
+
+def _proposals(cfg, store, data: dict) -> list[dict]:
+    """Weaknesses of a report.json with their stored fix, in rank order."""
+    out = []
+    for w in data["weaknesses"]:
+        if w.get("fix"):
+            out.append({"rank": w["rank"], "title": w["title"], "fix": fixer_mod.Fix(**w["fix"]), "experiment_ids": w["related_experiment_ids"]})
+    return out
+
+
+def _run_proposals(cfg, store, gmap, run_id) -> tuple[str, list[dict]]:
+    run = runs_mod.get(store, run_id)
+    if not run:
+        console.print("no such run" if run_id else "no runs stored")
+        raise typer.Exit(1)
+    path = _reports_dir() / run["run_id"] / "report.json"
+    if path.is_file():
+        data = json.loads(path.read_text())
+    else:
+        console.print("no stored report for this run; generating it (analyst and fixer)", markup=False)
+        state = _make_report(cfg, store, gmap, run["run_id"])
+        if state is None:
+            raise typer.Exit(1)
+        data = state["data"]
+    return run["run_id"], _proposals(cfg, store, data)
+
+
+def _experiment_proposals(cfg, store, gmap, exp_id, use_fixer=True) -> list[dict]:
+    try:
+        exp = exp_mod.get(store, exp_id)
+    except TypeError:
+        console.print("no such experiment", markup=False)
+        raise typer.Exit(1)
+    base = bl.latest(store)
+    analysis = {"experiments": [analyzer.analyze_experiment(cfg, exp, None, gmap, base["thresholds"] if base else None)]}
+    ws = analyst_mod.fallback_weaknesses(cfg, analysis)
+    a = analysis["experiments"][0]
+    if not ws and not use_fixer:
+        ws = [analyst_mod.Weakness(
+            rank=1, title=f"{a['label']} on {a['target']} (operator-selected experiment)", severity=analyzer.severity_of(a["penalty"]),
+            services=[], explanation="No weakness at the reporting threshold; the experiment was chosen with --override.",
+            related_experiment_ids=[exp_id], source="operator",
+        )]
+    if not ws:
+        console.print(f"{exp_id} shows no weakness at or above weak_min_penalty {cfg.score.weak_min_penalty:g}; nothing to fix", markup=False)
+        raise typer.Exit(1)
+    if not use_fixer:
+        stub = [fixer_mod.Fix(weakness_rank=w.rank, fix_title="Operator override", fix_type="config", steps="Supplied with --override.", source="operator") for w in ws]
+        return [{"rank": w.rank, "title": w.title, "fix": f, "experiment_ids": w.related_experiment_ids} for w, f in zip(ws, stub)]
+    res = fixer_mod.fix(cfg, store, analysis, gmap, ws)
+    console.print(f"fixer: {'FALLBACK (' + str(res.fallback_reason) + ')' if res.fallback else 'groq ' + res.model}", markup=False)
+    return [{"rank": w.rank, "title": w.title, "fix": f, "experiment_ids": w.related_experiment_ids} for w, f in zip(ws, res.fixes)]
+
+
+def _hc_line(c) -> str:
+    c.reload()
+    hc = c.attrs["HostConfig"]
+    rp = hc.get("RestartPolicy") or {}
+    return (f"{c.name}: restart {rp.get('Name') or 'no'}, memory {(hc.get('Memory') or 0) / fixes_mod.MB:g} MB, "
+            f"memswap {(hc.get('MemorySwap') or 0) / fixes_mod.MB:g} MB, cpu quota {hc.get('CpuQuota') or 0}")
+
+
+def _print_fix_result(f: dict):
+    d = f["details"] or {}
+    t = Table("experiments", "journey", "p95 ms before", "p95 ms after", "err % before", "err % after")
+    pct = lambda e: "-" if e is None else f"{100 * e:.1f}"
+    for pr in d.get("pairs", []):
+        for j, v in pr["journeys"].items():
+            t.add_row(f"{pr['before']} -> {pr['after']}", j, _fmt(v["p95_before"]), _fmt(v["p95_after"]), pct(v["err_before"]), pct(v["err_after"]))
+        t.add_row(f"{pr['before']} -> {pr['after']}", "PENALTY", _fmt(pr["before_penalty"], "{:.1f}"), _fmt(pr["after_penalty"], "{:.1f}"), "-", "-", style="bold")
+    console.print(t)
+    if d.get("reason"):
+        console.print(f"not verified: {d['reason']}", markup=False, highlight=False)
+    console.print(
+        f"fix #{f['id']} on {f['target']}: mean penalty {_fmt(f['before_penalty'], '{:.1f}')} -> {_fmt(f['after_penalty'], '{:.1f}')}, "
+        f"verdict {f['verdict']}, state {f['state']}", markup=False, highlight=False,
+    )
+
+
+def _fix_flow(cfg, store, gmap, proposals, run_id, weakness, yes, override, client=None) -> bool:
+    if override is not None:
+        pick = next((p for p in proposals if weakness in (None, p["rank"])), None)
+        if pick is None:
+            console.print("no weakness to attach the override to", markup=False)
+            return False
+        text, why = fixer_mod.check_override(override, set(gmap["nodes"]))
+        if text is None:
+            console.print(f"override rejected: {why}", markup=False)
+            return False
+        pick["fix"] = fixer_mod.Fix(weakness_rank=pick["rank"], fix_title="Operator override", fix_type="config", steps="Supplied with --override.", compose_override=text, source="operator")
+    t = Table("rank", "weakness", "fix", "applicable")
+    t.columns[3].overflow = "fold"
+    chosen = None
+    for p in proposals:
+        change, why = fixes_mod.applicable(cfg, p["fix"])
+        t.add_row(str(p["rank"]), p["title"][:60], p["fix"].fix_title[:50], fixes_mod.describe_change(change) if change else why)
+        if change and chosen is None and weakness in (None, p["rank"]):
+            chosen = (p, change)
+    console.print(t)
+    if chosen is None:
+        console.print("no auto-applicable fix; the proposals stay propose-only", markup=False)
+        return False
+    p, change = chosen
+    import docker
+
+    applier = fixes_mod.Applier(store, cfg, client or docker.from_env())
+    try:
+        _, lines = applier.preview(change)
+    except fixes_mod.Refused as e:
+        console.print(f"not applicable now: {e}", markup=False)
+        return False
+    console.print(f"weakness {p['rank']}: {p['title']}", markup=False, highlight=False)
+    console.print(f"change on {change['service']}: " + "; ".join(lines), markup=False, highlight=False)
+    if change["skipped"]:
+        console.print(f"propose-only part, not applied: {', '.join(change['skipped'])}", markup=False)
+    if not yes and not (sys.stdin.isatty() and typer.confirm("apply this change to the running container?")):
+        console.print("not applied: pass --yes to confirm", markup=False)
+        return False
+    befores = []
+    for i in p["experiment_ids"]:
+        e = exp_mod.get(store, i)
+        if e["injected_at"] is not None and e["state"] != "VETOED":
+            befores.append((fixes_mod.penalty_of(cfg, store, e, gmap), e))
+    befores = [e for _, e in sorted(befores, key=lambda x: -x[0])[: cfg.fix.rerun_max]]
+    if not befores:
+        console.print("the weakness has no injected experiment to re-run", markup=False)
+        return False
+
+    def rerun(e):
+        fault, target, duration, params = fixes_mod.rerun_args(e)
+        ctx = None
+        try:
+            ctx = safety_mod.context_from_map(gmap, target)
+        except Exception:
+            pass
+        return _run_experiment(store, cfg, fault, target, duration, params, ctx, gmap, review=True)
+
+    try:
+        f = fixes_mod.run_fix(store, cfg, applier, change, befores, rerun, gmap, run_id, p["rank"], log=lambda m: console.print(m, markup=False, highlight=False))
+    except fixes_mod.Refused as e:
+        console.print(f"fix refused: {e}", markup=False)
+        return False
+    _print_fix_result(f)
+    return f["verdict"] != fixes_mod.INCONCLUSIVE and f["state"] != fixes_mod.REVERT_FAILED
+
+
+@app.command("fix")
+def fix_cmd(
+    run_id: str = typer.Option(None, "--run", help="Run whose report weaknesses to fix (generated if missing)"),
+    experiment: str = typer.Option(None, "--experiment", help="Fix the weakness shown by one experiment (calls the Fixer)"),
+    weakness: int = typer.Option(None, "--weakness", min=1, help="Weakness rank (default: top auto-applicable)"),
+    yes: bool = typer.Option(False, "--yes", help="Apply without asking"),
+    override: Path = typer.Option(None, "--override", help="Compose override YAML to apply instead of the Fixer's (same checks)"),
+    revert: str = typer.Option(None, "--revert", help="Revert one fix by id, or `latest` for the newest unreverted one"),
+    revert_all: bool = typer.Option(False, "--revert-all", help="Restore the original values of every unreverted fix"),
+    list_all: bool = typer.Option(False, "--list", help="List recorded fixes"),
+):
+    """Apply a Fixer proposal to a running container (restart policy, raised memory or CPU limit), re-run the experiment and keep it only if it helps."""
+    cfg = load_config()
+    store = Store()
+    if list_all:
+        t = Table("id", "target", "state", "weakness", "before", "after", "verdict", "error")
+        for f in fixes_mod.Fixes(store).all():
+            t.add_row(str(f["id"]), f["target"], f["state"], str(f["weakness_rank"] or "-"), _fmt(f["before_penalty"], "{:.1f}"), _fmt(f["after_penalty"], "{:.1f}"), f["verdict"] or "-", f["error"] or "-")
+        console.print(t)
+        return
+    if revert is not None or revert_all:
+        import docker
+
+        applier = fixes_mod.Applier(store, cfg, docker.from_env())
+        open_ = applier.fixes.open()
+        if revert is not None and not revert_all:
+            ids = [open_[-1]["id"]] if revert == "latest" and open_ else [int(revert)] if revert.isdigit() else []
+            open_ = [f for f in applier.fixes.all() if f["id"] in ids]
+        if not open_:
+            console.print("no unreverted fix", markup=False)
+            return
+        bad = False
+        for f in open_:
+            try:
+                console.print("before: " + _hc_line(applier.container(f["target"])), markup=False, highlight=False)
+            except fixes_mod.Refused as e:
+                console.print(f"before: {e}", markup=False)
+            state = applier.revert(f["id"])
+            bad = bad or state != fixes_mod.REVERTED
+            try:
+                console.print("after:  " + _hc_line(applier.container(f["target"])), markup=False, highlight=False)
+            except fixes_mod.Refused as e:
+                console.print(f"after: {e}", markup=False)
+            console.print(f"fix #{f['id']} on {f['target']}: {state}", markup=False)
+        raise typer.Exit(1 if bad else 0)
+    if bool(run_id) == bool(experiment):
+        console.print("rejected: give exactly one of --run RUN_ID and --experiment EXPERIMENT_ID", markup=False)
+        raise typer.Exit(2)
+    overrides_path = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
+    gmap = planner_mod.load_map(cfg, overrides_path, _data_dir() / "map.json")
+    if bl.latest(store) is None:
+        console.print("no baseline; run `faultline baseline` first")
+        raise typer.Exit(2)
+    text = override.read_text() if override else None
+    if experiment:
+        rid, proposals = None, _experiment_proposals(cfg, store, gmap, experiment, use_fixer=text is None)
+    else:
+        rid, proposals = _run_proposals(cfg, store, gmap, run_id)
+    ok = _fix_flow(cfg, store, gmap, proposals, rid, weakness, yes, text)
+    raise typer.Exit(0 if ok else 1)
 
 
 @runs_app.command("show")

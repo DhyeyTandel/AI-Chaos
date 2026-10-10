@@ -118,6 +118,26 @@ CREATE TABLE IF NOT EXISTS run_rounds (
     PRIMARY KEY (run_id, round)
 );
 
+CREATE TABLE IF NOT EXISTS fixes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    weakness_rank INTEGER,
+    target TEXT NOT NULL,
+    change TEXT NOT NULL,
+    original TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    applied_at REAL,
+    reverted_at REAL,
+    error TEXT,
+    before_experiment_ids TEXT,
+    after_experiment_ids TEXT,
+    before_penalty REAL,
+    after_penalty REAL,
+    verdict TEXT,
+    details TEXT
+);
+
 CREATE TABLE IF NOT EXISTS llm_cache (
     key TEXT PRIMARY KEY,
     model TEXT NOT NULL,

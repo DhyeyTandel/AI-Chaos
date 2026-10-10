@@ -71,11 +71,12 @@ All commands run as `docker compose run --rm faultline <command>`.
 | `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]`, or `experiment --fault spike --duration S [--users N] [--spawn-rate R]` | One guarded fault: pre-flight safety review, then watchdog, revert and recovery measurement |
 | `experiment --combo PART --combo PART --duration S`, with `PART` = `fault:target[:key=value,...]` | Combined failure: two declared faults applied together as one experiment, e.g. `experiment --combo spike:traffic:users=100 --combo delay:quote:delay_ms=50 --duration 30`. Parts: `spike:traffic:users=N[,spawn_rate=R]`, `delay:SVC:delay_ms=N[,jitter_ms=N]`, `loss:SVC:loss_pct=N`, `crash:SVC` |
 | `plan [--top N]` | Rank candidate faults and validate the pick, without running it; lists candidates excluded by learned limits |
-| `run [--rounds N] [--report]` | Autonomous loop: plan, validate, execute, record, climb the risk ladder (1 to 8 rounds, default 3) |
+| `run [--rounds N] [--report [--fix --yes]]` | Autonomous loop: plan, validate, execute, record, climb the risk ladder (1 to 8 rounds, default 3) |
 | `runs show [RUN_ID]` | Print a stored run with hypotheses, pre-flight reviews, vetoes, exclusions and safety-agent decisions |
 | `report [--run RUN_ID]` | Analyze a stored run and write the report files under `reports/<run_id>/` |
+| `fix --run RUN_ID [--weakness N] [--yes]`, or `fix --experiment EXP_ID` | Fix verification: apply the top auto-applicable fix to the running container, re-run the same experiment, print before and after, keep the fix only if it improved. `--override FILE` applies a compose override you wrote instead. `--list`, `--revert ID\|latest`, `--revert-all` |
 | `ledger [-n N]` | Show the fault ledger |
-| `stop` | Kill switch: revert every open fault and remove sidecars |
+| `stop` | Kill switch: revert every open fault and remove sidecars (applied fixes are not touched; use `fix --revert-all`) |
 | `agents trace` | Recent agent calls: model, latency, tokens, fallback, input and output |
 | `agents usage` | Today's per-model requests and tokens against the daily budget, plus cache hits |
 
@@ -102,7 +103,7 @@ Faults are never applied without these layers in place. Each is independent of t
 | Write-ahead ledger | The fault is recorded in SQLite before it is applied, so anything left over can be found and reverted |
 | Watchdog | Every 1 s, judges each journey against thresholds derived from the baseline (error rate and p95, with floors in `faultline.toml`); aborts on breach, or if no samples arrive for 5 s |
 | Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss, spike users or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |
-| Cross-run planner memory | The lowest intensity per target and fault kind that the watchdog or safety agent aborted in the last 7 days is never proposed again (`[planner.memory]`). Aborts by the operator, preflight, inject or system are ignored |
+| Cross-run planner memory | The lowest intensity per target and fault kind that the watchdog or safety agent aborted in the last 7 days is never proposed again (`[planner.memory]`). Aborts by the operator, preflight, inject or system are ignored. The pre-flight reviewer is shown only watchdog and safety-agent aborts as aborts; an operator stop is shown as "stopped by operator (not a failure)" and preflight, inject and system aborts are left out |
 | Safety agent | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
 | Reaper | Separate always-on container; reverts faults past expiry, or all faults if the controller heartbeat is older than 10 s (measured live: 13 s) |
@@ -117,6 +118,15 @@ Faults are never applied without these layers in place. Each is independent of t
 - Memory: a combo aborted by the watchdog or safety agent records a combo limit keyed by the sorted pair of parts. It never becomes a single-fault limit, and singles stay proposable.
 - Planner: at tier 3 only (`[combined] planner`), up to 3 combo candidates built from pairs of tier 1 or 2 singles that each already completed. Scored deterministically like other candidates.
 - Report: labelled `combo: spike 100 users + delay quote 50 ms`, scored once as one experiment, listed part by part in the "Combined failures" section; hidden dependencies are attributed to the combo, not to a part.
+
+**Fix verification** (`faultline fix`, `[fix]` in `faultline.toml`) closes the loop on a proposed fix, still with a human in it:
+
+- Scope: only a `config` fix whose compose override names one allowlisted service and maps to a restart policy, a raised memory limit and/or a raised CPU limit is auto-applicable, within `max_memory_mb` (512) and `max_cpus` (2.0). Healthcheck, replica, code and architecture changes stay propose-only and are labelled so in the report. Limits are only ever raised and only where one already exists, because `docker update` cannot remove a limit again (so lowering, or adding a limit where none exists, is refused; the demo sets no CPU limits, so in practice the memory limit is the lever).
+- No `docker compose`: the controller container applies the change with the Docker API (`container.update`) on the running container, so bind mounts and the compose project are never touched.
+- Records: the original HostConfig values are written to the `fixes` table (state PENDING) before the change is made, then APPLIED. A fix is not a fault: it is not a ledger entry, so the reaper and `faultline stop` never revert it and it does not block experiments. `fix --revert ID`, `--revert` `latest` and `--revert-all` restore the stored originals and check them against `docker inspect`. An unreverted fix keeps its row (`fix --list`).
+- Flow: show the change, ask for `--yes` (or an interactive confirm), apply, wait until the container is running, healthy and not restarted for `settle_s`, then re-run the weakness's experiments (worst first, up to `rerun_max`) with the same parameters through the normal path: pre-flight review, watchdog, safety agent, kill switch, ledger. Mean penalty before and after is compared: IMPROVED (drop of at least `improve_min_penalty`, 5 points), WORSE, or NO CHANGE. A re-run that was vetoed, did not inject, was reduced by the review or hit an unstable container is INCONCLUSIVE. With `keep_if_improved = true` (default) the fix stays only on IMPROVED; otherwise the original values are restored. Ctrl+C or an error also restores them.
+- Report: a "Fix verification" section lists the change, before and after penalty and journey metrics, the verdict and whether the fix is kept or reverted. After-fix experiments are listed separately and are excluded from scores and history, so the before data is never overwritten.
+- `faultline run --rounds N --report --fix --yes` runs the same flow for the top auto-applicable weakness after the report.
 
 Crashes hold the container restart policy at `no` during the fault and restore it afterwards.
 
@@ -140,7 +150,7 @@ LangGraph pipeline; models are served by Groq's free tier.
 | Planner | `openai/gpt-oss-120b` (reasoning effort low) | Ranks the top 8 scored candidates, with a reason, hypothesis and predicted blast radius; sees the learned limits | Deterministic score order |
 | Validator | none (rules) | Rejects candidates that break the safety rules or run while faults are active | Not an LLM |
 | Analyst | `openai/gpt-oss-120b` | Ranks weaknesses with evidence and severity | Penalty-ranked weaknesses |
-| Fixer | `openai/gpt-oss-120b` | Proposes fixes, including validated Compose overrides (proposed only, never applied) | Fallback fixes |
+| Fixer | `openai/gpt-oss-120b` | Proposes fixes, including validated Compose overrides (applied only by `faultline fix`, and only the restart-policy and raised memory or CPU limit part) | Fallback fixes |
 | Safety agent | `openai/gpt-oss-20b` (reasoning effort low) | Pre-flight review (approve, reduce or veto) before injection; live continue or abort advice during a fault | Review approves; live checks ignored; watchdog verdict stands |
 
 The planner climbs a risk ladder: tier 1 (50 ms delays, crashes of services no journey needs), tier 2 (300 ms delay, 10 % loss, partial-impact crashes, core-path delays), tier 3 (critical or stateful crashes, including flagd). It climbs after 2 survived experiments at a tier, and a target that triggers an abort is excluded.
@@ -172,7 +182,7 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Safety agent (live advisory) | Done (gpt-oss-20b, verified live) |
 | Pre-flight safety review (approve, reduce, veto) | Done |
 | Cross-run planner memory and learned limits | Done |
-| Auto-apply of proposed fixes | Future |
+| Fixer auto-apply and re-run (`fix`) | Done (restart policy and raised memory or CPU limit only) |
 | Dashboard | Future |
 | Combined (multi-fault) failures | Done (`experiment --combo`, planner combos at tier 3) |
 | Full-disk and database-overload faults | Future |

@@ -176,3 +176,44 @@ def test_review_disabled_skips_step(rcfg, store):
     chat = Router(lambda n, u: reply("veto", "no"))
     run, script = graph_run(rcfg, store, chat)
     assert script.calls and chat.reviews == 0 and runs.rounds(store, run["run_id"])[0]["preflight"] is None
+
+
+def review_text(cfg, store):
+    base = seed(store)
+    return safety.build_review_input(cfg, store, base, "delay", "quote", 20, DELAY, 2, None, gmap(), [])
+
+
+def test_review_input_shows_only_watchdog_and_agent_aborts_as_aborts(cfg, store):
+    add_abort(store, "exp-w", "quote", source="watchdog")
+    add_abort(store, "exp-o", "quote", source="operator")
+    for i, src in enumerate(("preflight", "inject", "system", "revert")):
+        add_abort(store, f"exp-x{i}", "quote", source=src)
+    add_abort(store, "exp-ok", "quote", state="COMPLETED", source=None)
+    text = review_text(cfg, store)
+    recent = text.split("Recent outcomes on quote and its neighbours: ")[1]
+    assert recent.count("ABORTED by watchdog") == 1
+    assert "stopped by operator (not a failure)" in recent and "ABORTED by operator" not in recent
+    for src in ("preflight", "inject", "system", "revert"):
+        assert src not in recent
+    assert "COMPLETED" in recent
+
+
+def test_omitted_outcomes_do_not_use_up_the_recent_slots(cfg, store):
+    add_abort(store, "exp-w", "quote", source="watchdog", age_days=1)
+    for i in range(8):
+        add_abort(store, f"exp-p{i}", "quote", source="preflight")
+    assert "ABORTED by watchdog" in review_text(cfg, store)
+
+
+def test_legacy_rows_without_source_are_classified_by_reason(cfg, store):
+    add_abort(store, "exp-l1", "quote", source=None)
+    add_abort(store, "exp-l2", "quote", source=None)
+    with store.conn:
+        store.conn.execute("UPDATE experiments SET abort_reason = 'watchdog ABORT: p95' WHERE id = 'exp-l1'")
+        store.conn.execute("UPDATE experiments SET abort_reason = 'kill switch (STOP file)' WHERE id = 'exp-l2'")
+    recent = review_text(cfg, store).split("neighbours: ")[1]
+    assert "ABORTED by watchdog" in recent and "stopped by operator (not a failure)" in recent
+
+
+def test_review_prompt_says_operator_stop_is_not_a_failure():
+    assert "stopped by the operator" in safety.REVIEW_SYSTEM and "never be a reason to veto" in safety.REVIEW_SYSTEM

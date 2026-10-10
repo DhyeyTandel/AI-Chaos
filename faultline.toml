@@ -145,6 +145,16 @@ error_factor = 0.8        # and of each journey's error-rate limit
 max_per_plan = 3          # combo candidates kept in the planner's top-k
 tier = 3                  # risk tier of every combo candidate
 
+[fix]
+# `faultline fix`: applies a Fixer proposal to a running container through the Docker API (restart policy, raised memory or CPU limit) and re-runs the experiment
+max_memory_mb = 512       # largest memory limit a fix may set (limits are only ever raised, never lowered)
+max_cpus = 2.0            # largest CPU limit a fix may set (only where a CPU quota already exists)
+keep_if_improved = true   # true: keep the fix only on IMPROVED, revert otherwise; false: keep on IMPROVED or NO CHANGE (WORSE and INCONCLUSIVE always revert)
+improve_min_penalty = 5.0 # mean penalty must drop (IMPROVED) or rise (WORSE) by at least this many points, else NO CHANGE
+settle_s = 10             # container must be running, healthy and not restarted for this long before the re-run
+stable_timeout_s = 60     # give up (INCONCLUSIVE, fix reverted) if it is not stable by then
+rerun_max = 2             # most experiments of a weakness re-run (worst penalty first)
+
 [run]
 # `faultline run`: start at tier 1, climb one tier after climb_after survived experiments at the current tier
 climb_after = 2           # COMPLETED experiments (no abort) needed at a tier before climbing; max tier is 3

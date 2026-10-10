@@ -3,7 +3,7 @@ import json
 import time
 from pathlib import Path
 
-from . import analyzer, memory
+from . import analyzer, fixes as fixes_mod, memory
 from .agents import safety
 
 MARKER_INPUTS = ("ranking validation", "weakness validation", "fix validation")
@@ -72,7 +72,7 @@ def methodology_text(cfg) -> list[str]:
         f"A declared combined failure injects {cfg.combined.max_parts} faults together as one experiment (one ledger entry per part, one watchdog, one safety review). Every journey limit is tightened for it: p95 limit x{cfg.combined.p95_factor:g}, error-rate limit x{cfg.combined.error_factor:g}. It is scored once, as a whole.",
         "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
         f"A hidden dependency is a journey that degraded by at least {cfg.score.hidden_min_impact} although neither the hypothesis nor the dependency map expected it.",
-        "The analyst agent ranks weaknesses and the fixer agent proposes fixes from the measured results only; their output is validated against known experiments, services and an allowlist of compose keys. When Groq is unavailable or its output is invalid, rule-based fallbacks produce the same sections. Fixes are proposals and are never applied.",
+        "The analyst agent ranks weaknesses and the fixer agent proposes fixes from the measured results only; their output is validated against known experiments, services and an allowlist of compose keys. When Groq is unavailable or its output is invalid, rule-based fallbacks produce the same sections. Fixes are proposals; only restart-policy and raised memory or CPU limit fixes on one allowlisted service can be applied, by `faultline fix`, and are kept only if a re-run of the same experiment improves the penalty.",
     ]
 
 
@@ -114,9 +114,27 @@ def preflight_data(rounds: list[dict]) -> dict:
     return {"reviews": reviews, "vetoed": vetoed}
 
 
+def fix_data(store, analysis: dict) -> list[dict]:
+    out = []
+    for f in fixes_mod.report_rows(store, analysis):
+        d = f.get("details") or {}
+        out.append({
+            "id": f["id"], "service": f["target"], "change": fixes_mod.describe_change(f["change"]), "skipped": f["change"].get("skipped") or [],
+            "state": f["state"], "verdict": f["verdict"] or "not verified", "applied_at": f["applied_at"], "reverted_at": f["reverted_at"],
+            "weakness_rank": f["weakness_rank"], "before_penalty": f["before_penalty"], "after_penalty": f["after_penalty"],
+            "reason": d.get("reason"), "pairs": d.get("pairs") or [], "original": {k: v for k, v in f["original"].items() if k != "container"},
+            "before_experiments": f["before_experiment_ids"], "after": f["after"], "error": f["error"],
+        })
+    return out
+
+
 def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res, fixer_res, since: float) -> dict:
     fixes = {f.weakness_rank: f for f in fixer_res.fixes}
-    weaknesses = [{**w.model_dump(), "fix": fixes[w.rank].model_dump() if w.rank in fixes else None} for w in analyst_res.weaknesses]
+    weaknesses = [
+        {**w.model_dump(), "fix": fixes[w.rank].model_dump() if w.rank in fixes else None,
+         "applicability": fixes_mod.applicability_text(cfg, fixes[w.rank]) if w.rank in fixes else None}
+        for w in analyst_res.weaknesses
+    ]
     results = {
         "analyst": {"fallback": analyst_res.fallback, "reason": analyst_res.fallback_reason, "model": analyst_res.model},
         "fixer": {"fallback": fixer_res.fallback, "reason": fixer_res.fallback_reason, "model": fixer_res.model},
@@ -129,7 +147,7 @@ def build(cfg, store, run: dict, rounds: list[dict], analysis: dict, analyst_res
         "services": analysis["services"], "untested_services": analysis["untested"],
         "score_config": {k: v for k, v in vars(cfg.score).items()}, "formula": analyzer.formula_text(cfg),
         "methodology": methodology_text(cfg), "ai_usage": ai_usage(store, run, since, results),
-        "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, store, run, analysis),
+        "fix_verification": fix_data(store, analysis), "preflight": preflight_data(rounds), "learned_limits": learned_limits(cfg, store, run, analysis),
         "notes": {
             "analyst_dropped": analyst_res.dropped, "fixer_filled_by_fallback": fixer_res.filled,
             "recovery_not_measured": [a["experiment_id"] for a in analysis["experiments"] if a["injected"] and not a["recovery_measured"]],
@@ -146,7 +164,9 @@ def blocks(cfg, d: dict) -> list:
     b.append(("score", "n/a" if sc is None else f"{sc:.1f} / 100", f"Overall resilience score ({d['rating']}). Generated {fmt_ts(d['generated_at'])}."))
     b += [("h", 2, "Executive summary", ""), ("p", d["executive_summary"])]
     b.append(("h", 2, "Ranked weaknesses and proposed fixes", ""))
-    b.append(("p", "Fixes are proposals only. Nothing was applied to the running system."))
+    b.append(("p", "Fixes are proposals. Only a config fix that maps to a restart policy or a raised memory or CPU limit on one allowlisted service can be "
+                   "applied, by `faultline fix` after confirmation, and it is then verified by re-running the experiment (see Fix verification). "
+                   "Healthcheck, replica, code and architecture changes are propose-only. Nothing is applied by generating this report."))
     if not d["weaknesses"]:
         b.append(("p", "No weaknesses reached the reporting threshold."))
     for w in d["weaknesses"]:
@@ -156,12 +176,15 @@ def blocks(cfg, d: dict) -> list:
         f = w.get("fix")
         if f:
             b.append(("p", f"Proposed fix ({f['fix_type']}, {f['source']}): {f['fix_title']}. {f['steps']}"))
+            if w.get("applicability"):
+                b.append(("p", w["applicability"]))
             if f["compose_override"]:
-                b += [("p", "Compose override (not applied):"), ("code", f["compose_override"].rstrip())]
+                b += [("p", "Compose override:"), ("code", f["compose_override"].rstrip())]
             elif f.get("override_dropped"):
                 b.append(("p", f"Compose override dropped by validation: {f['override_dropped']}."))
             if f["expected_effect"]:
                 b.append(("p", "Expected effect: " + f["expected_effect"]))
+    b += fix_blocks(d.get("fix_verification") or [])
     run_exps = [a for a in d["experiments"] if a["scope"] == "run"]
     hist = [a for a in d["experiments"] if a["scope"] == "history"]
     b.append(("h", 2, "Experiments in this run", ""))
@@ -204,6 +227,44 @@ def blocks(cfg, d: dict) -> list:
     b.append(("p", f"Analyst weaknesses dropped by validation: {n['analyst_dropped']}. Fixes filled by the rule-based catalog: {n['fixer_filled_by_fallback']}."))
     if n.get("recovery_not_measured"):
         b.append(("p", "Recovery was not measured for " + ", ".join(n["recovery_not_measured"]) + " (stopped by the operator before recovery could be measured). Their recovery component is excluded from the penalty (counted as 0), not scored as never recovered."))
+    return b
+
+
+def fmt_pen(v) -> str:
+    return "-" if v is None else f"{v:.1f}"
+
+
+def fix_blocks(items: list[dict]) -> list:
+    b: list = [("h", 2, "Fix verification", "")]
+    if not items:
+        return b + [("p", "No fix was applied for the experiments in this report. Run `faultline fix --run <run id>` to apply the top auto-applicable fix and re-run its experiments.")]
+    b.append(("p", "Each applied fix was made through the Docker API on the running container, the same experiment was re-run with the same parameters, and the mean penalty "
+                   "before and after was compared. The before data is unchanged; after-fix experiments are listed separately and are not counted in the scores above. "
+                   "A fix is kept only when the verdict is IMPROVED (default); otherwise the original values are restored."))
+    b.append(("table", ["Fix", "Weakness", "Service and change", "Before penalty", "After penalty", "Verdict", "State"],
+              [[f"#{x['id']}", x["weakness_rank"] or "-", x["change"], fmt_pen(x["before_penalty"]), fmt_pen(x["after_penalty"]), x["verdict"],
+                x["state"] + (" (kept)" if x["state"] == fixes_mod.APPLIED else "")] for x in items]))
+    for x in items:
+        if x["reason"]:
+            b.append(("p", f"Fix #{x['id']} could not be verified: {x['reason']}."))
+        if x["skipped"]:
+            b.append(("p", f"Fix #{x['id']} propose-only part (not applied): {', '.join(x['skipped'])}."))
+        if x["error"]:
+            b.append(("p", f"Fix #{x['id']} note: {x['error']}"))
+        rows = []
+        for pr in x["pairs"]:
+            for j, v in pr["journeys"].items():
+                pct = lambda e: "-" if e is None else f"{100 * e:.1f}"
+                ms = lambda m: "-" if m is None else f"{m:.0f}"
+                rows.append([f"{pr['before']} -> {pr['after']}", j, ms(v["p95_before"]), ms(v["p95_after"]), pct(v["err_before"]), pct(v["err_after"])])
+        if rows:
+            b += [("p", f"Fix #{x['id']} journey metrics during the fault window, before and after:"),
+                  ("table", ["Experiments (before -> after)", "Journey", "p95 ms before", "p95 ms after", "err % before", "err % after"], rows)]
+        if x["after"]:
+            b += [("p", f"Fix #{x['id']} after-fix experiments:"),
+                  ("table", ["Experiment", "Fault", "Target", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Outcome"],
+                   [[a["experiment_id"], a["label"], a["target"], ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}",
+                     fmt_rec(a), f"{a['penalty']:.0f}", a["outcome"]] for a in x["after"]])]
     return b
 
 
