@@ -99,7 +99,7 @@ Faults are never applied without these layers in place. Each is independent of t
 |---|---|
 | Preflight | Refuses to start unless the system is within baseline thresholds |
 | Target allowlist | Only listed application services are targetable; observability and tooling never are; `frontend-proxy` cannot be crashed |
-| Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 %, spike 150 users |
+| Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 %, spike 100 users (revert accepts up to 2 users over the original) |
 | Write-ahead ledger | The fault is recorded in SQLite before it is applied, so anything left over can be found and reverted |
 | Watchdog | Every 1 s, judges each journey against thresholds derived from the baseline (error rate and p95, with floors in `faultline.toml`); aborts on breach, or if no samples arrive for 5 s |
 | Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss, spike users or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |

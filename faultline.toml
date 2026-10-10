@@ -34,7 +34,7 @@ max_duration_s = 120      # longest allowed fault
 max_delay_ms = 2000       # network delay cap
 max_jitter_ms = 500       # network jitter cap
 max_loss_pct = 30         # packet loss cap
-max_spike_users = 150     # traffic spike cap: Locust users (and spawn rate)
+max_spike_users = 100     # traffic spike cap (150 overloaded the load generator): Locust users (and spawn rate)
 # Targets allowed for any fault. Tooling and observability are always refused in code.
 allow = [
   "accounting", "ad", "astronomy-db", "cart", "checkout", "currency", "email",

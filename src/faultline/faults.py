@@ -19,6 +19,8 @@ OWNED_LABEL = "faultline.owned"
 ID_LABEL = "faultline.ledger_id"
 ROLE_LABEL = "faultline.role"
 EXPIRES_LABEL = "faultline.expires_at"
+SPIKE_REVERT_TOLERANCE = 2
+SPIKE_VERIFY_S = 20.0
 TARGET_LABEL = "faultline.target"
 
 DETECT_IF = (
@@ -224,9 +226,10 @@ class DockerDriver:
             users = entry["revert"].get("users")
             if users is None:
                 return True
-            end = time.time() + timeout
+            # an overloaded load generator can settle a few users above the stored count
+            end = time.time() + max(timeout, SPIKE_VERIFY_S)
             while True:
-                if self.locust.stats()["user_count"] <= users:
+                if self.locust.stats()["user_count"] <= users + SPIKE_REVERT_TOLERANCE:
                     return True
                 if time.time() >= end:
                     return False

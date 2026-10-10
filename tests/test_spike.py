@@ -166,7 +166,7 @@ def test_validate_defaults_and_caps(cfg):
     p = validate(cfg, "spike", faults.TRAFFIC, 30, {})
     assert p["users"] == 50 and p["spawn_rate"] == 25
     cap = cfg.safety.max_spike_users
-    assert cap == 150
+    assert cap == 100
     assert validate(cfg, "spike", faults.TRAFFIC, 30, {"users": cap})["users"] == cap
     for bad in ({"users": cap + 1}, {"users": 0}, {"users": "x"}, {"spawn_rate": cap + 1}, {"spawn_rate": 0}):
         with pytest.raises(ValidationError):

@@ -22,7 +22,7 @@ DEFAULTS = {
         "max_delay_ms": 2000,
         "max_jitter_ms": 500,
         "max_loss_pct": 30,
-        "max_spike_users": 150,
+        "max_spike_users": 100,
         "allow": [
             "accounting", "ad", "astronomy-db", "cart", "checkout", "currency", "email",
             "flagd", "fraud-detection", "frontend", "frontend-proxy", "image-provider",
