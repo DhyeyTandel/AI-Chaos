@@ -19,6 +19,9 @@ services:
   grafana:
     profiles: ["full-observability"]
   frontend-proxy:
+    ports: !override
+      - "${FAULTLINE_BIND:-0.0.0.0}:${SHOP_PORT:-8080}:8080"
+      - "${FAULTLINE_BIND:-0.0.0.0}:${ENVOY_ADMIN_HOST_PORT:-10000}:10000"
     depends_on: !override
       frontend:
         condition: service_healthy
@@ -47,3 +50,9 @@ services:
         condition: service_started
       opamp-server:
         condition: service_healthy
+
+  # Host bind address and ports are configurable (root .env) so the stack can share a
+  # machine with other services. Defaults match upstream.
+  prometheus:
+    ports: !override
+      - "${FAULTLINE_BIND:-0.0.0.0}:${PROMETHEUS_HOST_PORT:-9090}:9090"
