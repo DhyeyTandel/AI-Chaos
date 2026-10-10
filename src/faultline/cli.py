@@ -1,23 +1,35 @@
 import asyncio
+import os
 import signal
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import docker_api
+from . import baseline as bl
+from . import docker_api, experiment as exp_mod, faults, mapper, observer
+from . import reaper as reaper_mod
+from .config import load_config
+from .injector import Injector
+from .ledger import REVERTED, Ledger
 from .prober import JOURNEYS, run_probe
 from .stats import journey_stats
-from .store import Store
+from .store import Store, default_db_path
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
 
+DEMO_SAFE = ("quote", "delay", 150)
+DEMO_BREACH = ("product-catalog", "crash", 30)
 
-@app.command()
-def status():
-    """Show all ai-chaos containers. Exit 1 if any is not running or unhealthy."""
+
+def _data_dir() -> Path:
+    return Path(default_db_path()).parent
+
+
+def _status_table() -> bool:
     infos = docker_api.list_project_containers()
     table = Table("name", "state", "health", "restarts", "oom")
     bad = not infos
@@ -29,7 +41,23 @@ def status():
     console.print(table)
     if not infos:
         console.print("no containers found for project ai-chaos")
-    raise typer.Exit(1 if bad else 0)
+    return bad
+
+
+@app.command()
+def status():
+    """Show all ai-chaos containers. Exit 1 if any is not running or unhealthy."""
+    raise typer.Exit(1 if _status_table() else 0)
+
+
+async def _probe_for(store, seconds, timeout=5.0):
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, stop.set)
+    except NotImplementedError:
+        pass
+    await run_probe(store, seconds, timeout=timeout, stop=stop)
 
 
 @app.command()
@@ -37,18 +65,8 @@ def probe(seconds: int = typer.Option(30, "--seconds", "-s", min=1)):
     """Run the journey prober for N seconds and print per-journey stats."""
     store = Store()
     t0 = time.time()
-
-    async def main():
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, stop.set)
-        except NotImplementedError:
-            pass
-        await run_probe(store, seconds, stop=stop)
-
     try:
-        asyncio.run(main())
+        asyncio.run(_probe_for(store, seconds))
     except KeyboardInterrupt:
         console.print("interrupted")
 
@@ -68,3 +86,264 @@ def probe(seconds: int = typer.Option(30, "--seconds", "-s", min=1)):
     console.print(table)
     store.close()
     raise typer.Exit(1 if failed else 0)
+
+
+def _fmt(v, spec="{:.0f}"):
+    return "-" if v is None else spec.format(v)
+
+
+def _print_map(g: dict, full: bool = True):
+    counts = {}
+    for e in g["edges"]:
+        counts[e["origin"]] = counts.get(e["origin"], 0) + 1
+    console.print(
+        f"nodes: {len(g['nodes'])}  edges: {len(g['edges'])}  "
+        + "  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+        + f"  dynamic source: {g['dynamic_source'] or 'none'}",
+        markup=False,
+    )
+    for n in g["notes"]:
+        console.print(f"note: {n}", markup=False)
+    if full:
+        t = Table("source", "target", "origin", "via", "calls")
+        t.columns[3].overflow = "fold"
+        for e in g["edges"]:
+            t.add_row(e["source"], e["target"], e["origin"], ",".join(e["via"]), str(e["calls"]))
+        console.print(t)
+    jt = Table("journey", "from", "services")
+    for j, v in g["journeys"].items():
+        jt.add_row(j, v["source"], ", ".join(v["services"]))
+    console.print(jt)
+    console.print(
+        "hidden dependency candidates (traces only): " + (", ".join(g["hidden"]["traces_only"]) or "none"),
+        markup=False,
+    )
+    console.print(
+        "static only (never seen in traces): " + (", ".join(g["hidden"]["static_only"]) or "none"), markup=False
+    )
+    if full:
+        console.print("\nMermaid:", markup=False)
+        print(mapper.mermaid(g))
+
+
+@app.command("map")
+def map_cmd(lookback: int = typer.Option(None, "--lookback", help="Jaeger lookback minutes")):
+    """Build the service dependency map (static + traces) and write /data/map.json."""
+    cfg = load_config()
+    if lookback:
+        cfg.map.lookback_min = lookback
+    overrides = os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml")
+    g = mapper.build_map(cfg, overrides, _data_dir() / "map.json")
+    _print_map(g)
+    console.print(f"wrote {_data_dir() / 'map.json'}", markup=False)
+
+
+def _print_baseline(b: dict):
+    console.print(
+        f"baseline #{b['id']} at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(b['ts']))}  "
+        f"params: {b['params']}",
+        markup=False,
+    )
+    t = Table("journey", "n", "success %", "p50 ms", "p95 ms", "mean ms", "stddev ms", "err max %", "p95 max ms")
+    for j, s in b["journeys"].items():
+        th = b["thresholds"][j]
+        t.add_row(
+            j, str(s["count"]), _fmt(None if s["success_rate"] is None else s["success_rate"] * 100, "{:.1f}"),
+            _fmt(s["p50_ms"]), _fmt(s["p95_ms"]), _fmt(s["mean_ms"]), _fmt(s["stddev_ms"]),
+            f"{th['error_rate_max'] * 100:.1f}", f"{th['p95_max_ms']:.0f}",
+        )
+    console.print(t)
+    svc = b.get("services")
+    if svc:
+        st = Table("service", "calls/s", "error %", "p95 ms (prometheus)")
+        for name, v in sorted(svc.items(), key=lambda kv: -(kv[1].get("p95_ms") or 0))[:12]:
+            st.add_row(name, _fmt(v.get("rate"), "{:.2f}"), _fmt(100 * v.get("error_ratio", 0), "{:.2f}"), _fmt(v.get("p95_ms")))
+        console.print(st)
+    elif b.get("services_note"):
+        console.print(b["services_note"], markup=False)
+
+
+@app.command()
+def baseline(
+    seconds: int = typer.Option(None, "--seconds", "-s", min=1),
+    warmup: int = typer.Option(None, "--warmup", "-w", min=0),
+    show: bool = typer.Option(False, "--show", help="Print the latest stored baseline"),
+):
+    """Measure steady state, derive thresholds, and store them."""
+    store = Store()
+    if show:
+        b = bl.latest(store)
+        if not b:
+            console.print("no baseline stored")
+            raise typer.Exit(1)
+        _print_baseline(b)
+        return
+    cfg = load_config()
+    _baseline_run(store, cfg, seconds or cfg.baseline.seconds, cfg.baseline.warmup if warmup is None else warmup)
+
+
+def _baseline_run(store, cfg, seconds, warmup) -> dict:
+    t0 = time.time()
+    console.print(f"probing {warmup}s warm-up + {seconds}s measurement", markup=False)
+    try:
+        asyncio.run(_probe_for(store, warmup + seconds, cfg.watchdog.probe_timeout_s))
+    except KeyboardInterrupt:
+        console.print("interrupted")
+        raise typer.Exit(1)
+    rows = {j: store.query(journey=j, since=t0 + warmup) for j in JOURNEYS}
+    if not all(rows.values()):
+        console.print("no samples for some journeys; is the stack up?")
+        raise typer.Exit(1)
+    data = bl.compute(rows, cfg)
+    try:
+        data["services"] = observer.prom_service_stats(max(60, seconds))
+        if not data["services"]:
+            data["services_note"] = "prometheus returned no span metrics"
+    except Exception as e:
+        data["services"], data["services_note"] = {}, f"prometheus unavailable: {type(e).__name__}"
+    bid = bl.save(store, data, {"seconds": seconds, "warmup": warmup})
+    b = bl.latest(store)
+    assert b["id"] == bid
+    _print_baseline(b)
+    return b
+
+
+def _print_experiment(e: dict):
+    t = Table("id", "fault", "target", "state", "recovery s", "abort reason")
+    rec = e["recovery_seconds"]
+    t.add_row(
+        e["id"], e["fault"], e["target"], e["state"],
+        "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}"),
+        e["abort_reason"] or "-",
+        style="red" if e["state"] == "ABORTED" else "green",
+    )
+    console.print(t)
+    if e["impact"]:
+        it = Table("journey", "n", "err % (fault)", "err % (base)", "p95 ms (fault)", "p95 ms (base)")
+        for j, v in e["impact"].items():
+            it.add_row(
+                j, str(v["count"]), _fmt(None if v["error_rate"] is None else v["error_rate"] * 100, "{:.1f}"),
+                _fmt(None if v["base_error_rate"] is None else v["base_error_rate"] * 100, "{:.1f}"),
+                _fmt(v["p95_ms"]), _fmt(v["base_p95_ms"]),
+            )
+        console.print(it)
+
+
+def _run_experiment(store, cfg, fault, target, duration, params) -> dict:
+    driver = faults.DockerDriver()
+    try:
+        return asyncio.run(
+            exp_mod.run_experiment(store, driver, cfg, fault, target, duration, params, log=lambda m: console.print(m, markup=False, highlight=False))
+        )
+    except faults.ValidationError as e:
+        console.print(f"rejected: {e}", markup=False)
+        raise typer.Exit(2)
+    except KeyboardInterrupt:
+        console.print("interrupted; reverting", markup=False)
+        Injector(Ledger(store), driver, cfg).revert_all()
+        raise typer.Exit(1)
+
+
+@app.command()
+def experiment(
+    fault: str = typer.Option(..., "--fault", help="crash | delay"),
+    target: str = typer.Option(..., "--target"),
+    duration: int = typer.Option(..., "--duration", min=1),
+    delay_ms: float = typer.Option(200, "--delay-ms"),
+    jitter_ms: float = typer.Option(0, "--jitter-ms"),
+    loss_pct: float = typer.Option(0, "--loss-pct"),
+):
+    """Run one guarded fault injection with watchdog, revert, and recovery measurement."""
+    cfg = load_config()
+    store = Store()
+    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct})
+    _print_experiment(e)
+    raise typer.Exit(0 if e["state"] == "COMPLETED" else 1)
+
+
+def _print_ledger(store, limit=20):
+    entries = Ledger(store).all()[-limit:]
+    t = Table("id", "experiment", "kind", "target", "state", "applied", "reverted", "error")
+    ts = lambda v: "-" if not v else time.strftime("%H:%M:%S", time.localtime(v))
+    for e in entries:
+        t.add_row(str(e["id"]), e["experiment_id"] or "-", e["kind"], e["target"], e["state"], ts(e["applied_at"]), ts(e["reverted_at"]), e["error"] or "-")
+    console.print(t)
+    return entries
+
+
+@app.command()
+def ledger(limit: int = typer.Option(20, "--limit", "-n")):
+    """Show the fault ledger."""
+    _print_ledger(Store(), limit)
+
+
+@app.command()
+def stop():
+    """Kill switch: revert every open ledger entry and remove faultline sidecars."""
+    cfg = load_config()
+    store = Store()
+    sentinel = exp_mod.stop_path()
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text(str(time.time()))
+    try:
+        inj = Injector(Ledger(store), faults.DockerDriver(), cfg)
+        results = inj.revert_all()
+        time.sleep(2.5)
+    finally:
+        sentinel.unlink(missing_ok=True)
+    left = Ledger(store).open_entries()
+    console.print(f"reverted: {results or 'nothing open'}", markup=False)
+    if left:
+        console.print(f"still open: {[e['id'] for e in left]}", markup=False)
+        raise typer.Exit(1)
+
+
+@app.command()
+def reaper():
+    """Dead-man's switch: revert expired faults and everything when the controller heartbeat goes stale."""
+    cfg = load_config()
+    store = Store()
+    flag = {"stop": False}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: flag.update(stop=True))
+    reaper_mod.run(store, faults.DockerDriver(), cfg, log=lambda m: print(m, flush=True), stop=lambda: flag["stop"])
+
+
+@app.command()
+def demo(day1: bool = typer.Option(False, "--day1", help="Run the Day 1 end-to-end demo")):
+    """Run the scripted demo."""
+    if not day1:
+        console.print("pass --day1")
+        raise typer.Exit(2)
+    cfg = load_config()
+    store = Store()
+    head = lambda s: console.print(f"\n=== {s} ===", markup=False)
+
+    head("1. STATUS")
+    _status_table()
+
+    head("2. MAP")
+    g = mapper.build_map(cfg, os.environ.get("FAULTLINE_OVERRIDES", "/app/map.overrides.yaml"), _data_dir() / "map.json")
+    _print_map(g, full=False)
+
+    head("3. BASELINE (30s + 5s warm-up)")
+    _baseline_run(store, cfg, 30, 5)
+
+    target, fault, val = DEMO_SAFE
+    head(f"4. SAFE EXPERIMENT: {fault} {val}ms on {target}, expected to COMPLETE")
+    params = {"delay_ms": val}
+    e1 = _run_experiment(store, cfg, fault, target, 20, params)
+    _print_experiment(e1)
+
+    target, fault, dur = DEMO_BREACH
+    head(f"5. BREACHING EXPERIMENT: {fault} {target}, expected to be ABORTED by the watchdog")
+    e2 = _run_experiment(store, cfg, fault, target, dur, {})
+    _print_experiment(e2)
+
+    head("6. LEDGER")
+    entries = _print_ledger(store, 10)
+    ok = bool(entries) and all(e["state"] == REVERTED for e in entries)
+    console.print("all ledger entries REVERTED" if ok else "LEDGER HAS OPEN ENTRIES", markup=False)
+    result = e1["state"] == "COMPLETED" and e2["state"] == "ABORTED" and ok
+    console.print(f"demo {'PASSED' if result else 'FAILED'}", markup=False)
+    raise typer.Exit(0 if result else 1)

@@ -1,0 +1,8 @@
+# Manual corrections applied after static and trace edges are merged.
+# add_edges:
+#   - {source: checkout, target: flagd}
+# remove_edges:
+#   - {source: frontend, target: otel-collector}
+# stateful: [astronomy-db]    # extra nodes to flag as stateful
+add_edges: []
+remove_edges: []

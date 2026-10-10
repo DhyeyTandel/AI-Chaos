@@ -21,6 +21,21 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - faultline-data:/data
+      - ./faultline.toml:/app/faultline.toml:ro
+      - ./map.overrides.yaml:/app/map.overrides.yaml:ro
+
+  reaper:
+    container_name: reaper
+    image: ai-chaos/faultline:dev
+    build: .
+    command: ["reaper"]
+    restart: unless-stopped
+    environment:
+      FAULTLINE_DB: /data/faultline.db
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - faultline-data:/data
+      - ./faultline.toml:/app/faultline.toml:ro
 
 volumes:
   faultline-data:

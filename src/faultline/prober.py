@@ -57,6 +57,7 @@ class Prober:
     def __init__(self, client: httpx.AsyncClient, timeout: float = 5.0):
         self.client = client
         self.timeout = timeout
+        self.sink = None
 
     async def _req(self, method, path, **kw):
         try:
@@ -116,7 +117,10 @@ class Prober:
             ok, status, error = False, e.status, str(e)
         except Exception as e:
             ok, error = False, f"{type(e).__name__}: {e}"
-        return Sample(wall, mono, name, ok, status, (time.monotonic() - mono) * 1000, error)
+        sample = Sample(wall, mono, name, ok, status, (time.monotonic() - mono) * 1000, error)
+        if self.sink:
+            self.sink(sample)
+        return sample
 
     async def tick(self) -> list[Sample]:
         async def cart_then_checkout():
@@ -135,6 +139,9 @@ async def run_probe(store, seconds: float, interval: float = 1.0, timeout: float
     nxt = start
     async with httpx.AsyncClient(base_url=base_url or target_url(), transport=transport) as client:
         prober = Prober(client, timeout)
+        prober.sink = lambda s: store.insert_sample(
+            s.ts_wall, s.ts_mono, s.journey, s.ok, s.status, s.latency_ms, s.error
+        )
         while not stop.is_set():
             now = time.monotonic()
             if now - start >= seconds:
@@ -145,10 +152,7 @@ async def run_probe(store, seconds: float, interval: float = 1.0, timeout: float
                     break
                 except asyncio.TimeoutError:
                     pass
-            samples = await prober.tick()
-            store.insert_many(
-                [(s.ts_wall, s.ts_mono, s.journey, s.ok, s.status, s.latency_ms, s.error) for s in samples]
-            )
+            await prober.tick()
             now = time.monotonic()
             nxt += interval
             if nxt <= now:

@@ -14,6 +14,51 @@ CREATE TABLE IF NOT EXISTS probe_samples (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_samples_journey_ts ON probe_samples (journey, ts_wall);
+
+CREATE TABLE IF NOT EXISTS baselines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    params TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    params TEXT NOT NULL,
+    revert TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    applied_at REAL,
+    expires_at REAL NOT NULL,
+    reverted_at REAL,
+    error TEXT,
+    lease_until REAL
+);
+
+CREATE TABLE IF NOT EXISTS heartbeat (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    ts REAL NOT NULL,
+    experiment_id TEXT,
+    pid INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id TEXT PRIMARY KEY,
+    fault TEXT NOT NULL,
+    target TEXT NOT NULL,
+    params TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    injected_at REAL,
+    reverted_at REAL,
+    finished_at REAL,
+    abort_reason TEXT,
+    recovery_seconds REAL,
+    impact TEXT
+);
 """
 
 
@@ -26,7 +71,7 @@ class Store:
         self.path = str(path or default_db_path())
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")

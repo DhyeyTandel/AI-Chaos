@@ -38,3 +38,25 @@ def list_project_containers(client=None, project: str = PROJECT) -> list[Contain
             )
         )
     return sorted(out, key=lambda i: i.name)
+
+
+DEPENDS_LABEL = "com.docker.compose.depends_on"
+
+
+def container_details(client=None, project: str = PROJECT) -> list[dict]:
+    client = client or docker.from_env()
+    found = client.containers.list(all=True, filters={"label": f"{PROJECT_LABEL}={project}"})
+    out = []
+    for c in found:
+        labels = c.labels or {}
+        if labels.get(ONEOFF_LABEL) == "True":
+            continue
+        env = dict(e.split("=", 1) for e in (c.attrs.get("Config", {}).get("Env") or []) if "=" in e)
+        out.append(
+            {
+                "service": labels.get(SERVICE_LABEL, c.name),
+                "env": env,
+                "depends_on": [p.split(":", 1)[0] for p in labels.get(DEPENDS_LABEL, "").split(",") if p.strip()],
+            }
+        )
+    return out

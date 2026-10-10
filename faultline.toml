@@ -1,0 +1,53 @@
+# Faultline configuration. Every key has a code default; this file overrides them.
+
+[baseline]
+seconds = 60              # steady-state measurement length after warm-up
+warmup = 10               # seconds of probing discarded before measuring
+
+[thresholds]
+# journey error_rate_max = max(error_floor, baseline_err + k_sigma * sigma)
+# sigma is the binomial std dev of an error rate measured over one watchdog window
+error_floor = 0.2         # never trip below this error rate
+k_sigma = 3.0             # sigmas above baseline error rate
+# journey p95_max_ms = max(p95_floor_ms, baseline_p95 * p95_multiplier)
+p95_floor_ms = 800        # never trip below this p95 latency
+p95_multiplier = 3.0      # allowed slowdown vs baseline p95
+
+[watchdog]
+interval_s = 1.0          # evaluation period
+window_s = 10             # sliding window of recent samples judged per journey
+min_samples = 5           # samples a journey needs in the window before it is judged
+breach_ticks = 2          # consecutive breaching evaluations before ABORT
+blind_s = 5               # no prober samples for this long means ABORT (blind is unsafe)
+probe_timeout_s = 3.0     # per-request prober timeout during experiments
+
+[preflight]
+probe_s = 8               # probe window that must be within thresholds before injecting
+
+[recovery]
+window_s = 10             # sliding window that must be back within thresholds
+min_samples = 5           # post-revert samples per journey required
+cap_s = 120               # give up and record "never recovered" after this long
+
+[safety]
+max_duration_s = 120      # longest allowed fault
+max_delay_ms = 2000       # network delay cap
+max_jitter_ms = 500       # network jitter cap
+max_loss_pct = 30         # packet loss cap
+# Targets allowed for any fault. Tooling and observability are always refused in code.
+allow = [
+  "accounting", "ad", "astronomy-db", "cart", "checkout", "currency", "email",
+  "flagd", "fraud-detection", "frontend", "frontend-proxy", "image-provider",
+  "kafka", "payment", "product-catalog", "quote", "recommendation", "shipping",
+  "valkey-cart",
+]
+crash_exclude = ["frontend-proxy"]   # allowed for delay, refused for crash
+expiry_margin_s = 5       # ledger expires_at = apply time + duration + margin
+
+[reaper]
+interval_s = 2.0          # reaper loop period
+stale_s = 10              # controller heartbeat older than this means revert everything
+heartbeat_s = 1.0         # controller heartbeat period during an experiment
+
+[map]
+lookback_min = 60         # Jaeger lookback for dynamic edges and journey traces
