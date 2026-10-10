@@ -1,0 +1,26 @@
+name: ai-chaos
+
+include:
+  - path:
+      - vendor/opentelemetry-demo/compose.yaml
+      - vendor/opentelemetry-demo/compose.full.yaml
+      - vendor/opentelemetry-demo/compose.observability.yaml
+      - vendor/opentelemetry-demo/compose.extras.yaml
+    env_file:
+      - vendor/opentelemetry-demo/.env
+      - demo.env
+
+services:
+  faultline:
+    build: .
+    image: ai-chaos/faultline:dev
+    profiles: ["cli"]
+    environment:
+      FAULTLINE_TARGET: http://frontend-proxy:8080
+      FAULTLINE_DB: /data/faultline.db
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - faultline-data:/data
+
+volumes:
+  faultline-data:

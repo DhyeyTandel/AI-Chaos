@@ -1,0 +1,11 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.db
+reports/runs/
+.DS_Store
+.vibe-wise/
+*.egg-info/
