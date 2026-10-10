@@ -162,6 +162,7 @@ def test_graph_gives_up_after_three_rejections(cfg, store, monkeypatch):
 
 def test_graph_ends_with_no_plan_after_max_attempts(cfg, store):
     cfg.safety.allow = []
+    cfg.planner.spike_users = []
     state = plan_graph.run_plan(cfg, gmap(), store)
     assert state["selected"] is None and state["validation"][1] == "no candidates"
 

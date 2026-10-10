@@ -34,6 +34,7 @@ max_duration_s = 120      # longest allowed fault
 max_delay_ms = 2000       # network delay cap
 max_jitter_ms = 500       # network jitter cap
 max_loss_pct = 30         # packet loss cap
+max_spike_users = 150     # traffic spike cap: Locust users (and spawn rate)
 # Targets allowed for any fault. Tooling and observability are always refused in code.
 allow = [
   "accounting", "ad", "astronomy-db", "cart", "checkout", "currency", "email",
@@ -90,6 +91,10 @@ duration_s = 20           # delay-fault duration
 crash_duration_s = 20     # crash-fault duration
 delay_ms = [50, 300]      # delay intensity menu
 loss_pct = [10]           # packet-loss intensity menu (with 1 ms delay)
+spike_users = [50, 100]   # traffic-spike intensity menu (Locust users; the shop idles at 5)
+spike_spawn_rate = 25     # users started per second
+spike_duration_s = 30     # spike-fault duration
+spike_tier = 2            # risk tier of every spike candidate
 exclude = []              # extra targets the planner never proposes (allowlist is [safety].allow)
 history = 10              # past experiments read for the recent_result component
 
@@ -110,6 +115,7 @@ severity = 0.5            # fault strength, see [planner.severity]
 
 [planner.severity]
 crash = 1.0
+spike = 0.7
 delay300 = 0.6
 loss = 0.5
 delay50 = 0.2
@@ -117,7 +123,7 @@ delay50 = 0.2
 [planner.tiers]
 # risk ladder, applied to every candidate as `tier` (derived from the map's journeys and stateful flags)
 #   tier 1: delay <= light_delay_ms on any allowed target; crash of a service no journey depends on
-#   tier 2: delay above light_delay_ms (300 ms); packet loss; crash of a service on some but not all journeys
+#   tier 2: delay above light_delay_ms (300 ms); packet loss; traffic spike (spike_tier); crash of a service on some but not all journeys
 #   tier 3: crash of a service on every journey, or of a stateful service (data store, broker)
 light_delay_ms = 50       # delays up to this are tier 1, above it tier 2
 critical = ["flagd"]      # extra targets whose crash is always tier 3 (flagd: hidden dependency, crash made cart p95 3s)

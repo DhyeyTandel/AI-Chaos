@@ -47,6 +47,10 @@ class Ledger:
                 (APPLIED, time.time(), entry_id, PENDING),
             )
 
+    def set_revert(self, entry_id: int, revert: dict):
+        with self.conn:
+            self.conn.execute("UPDATE ledger SET revert = ? WHERE id = ?", (json.dumps(revert), entry_id))
+
     def claim(self, entry_id: int, lease_s: float = LEASE_S) -> bool:
         now = time.time()
         with self.conn:

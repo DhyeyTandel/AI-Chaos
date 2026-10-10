@@ -13,6 +13,7 @@ TEMPLATE_FAULT = {
     "crash": "is crashed",
     "delay": "gets added network latency",
     "loss": "suffers packet loss",
+    "spike": "faces a traffic surge",
 }
 
 
@@ -100,6 +101,8 @@ def assign_tier(cfg, graph: dict, c: Candidate) -> int:
     over = vars(t.overrides).get(c.id)
     if over:
         return int(over)
+    if c.fault == "spike":
+        return int(cfg.planner.spike_tier)
     if c.fault == "crash":
         journeys = graph.get("journeys") or {}
         hit = sum(1 for v in journeys.values() if c.target in v["services"])
@@ -134,6 +137,11 @@ def generate_candidates(cfg, graph: dict) -> list[Candidate]:
                 id=f"loss:{target}:{pct}pct", fault="delay", kind="loss", target=target,
                 params={"delay_ms": 1, "jitter_ms": 0, "loss_pct": pct}, duration_s=p.duration_s, label=f"loss {pct}%",
             ))
+    for u in p.spike_users:
+        out.append(Candidate(
+            id=f"spike:{faults.TRAFFIC}:{u}users", fault="spike", kind="spike", target=faults.TRAFFIC,
+            params={"users": u, "spawn_rate": p.spike_spawn_rate}, duration_s=p.spike_duration_s, label=f"spike {u} users",
+        ))
     for c in out:
         c.tier = assign_tier(cfg, graph, c)
     return out
@@ -205,7 +213,7 @@ def score_candidates(cfg, graph: dict, hist: list[dict], cands: list[Candidate])
             recent -= 1.0
         comps = {
             "fan_in": fan.get(c.target, 0) / max_fan,
-            "journeys_affected": (sum(1 for v in journeys.values() if c.target in v["services"]) / len(journeys)) if journeys else 0.0,
+            "journeys_affected": (len(analyzer.mapped_journeys(graph, c.target)) / len(journeys)) if journeys else 0.0,
             "stateful": 1.0 if node.get("stateful") else 0.0,
             "untested": untested,
             "recent_result": recent,
@@ -253,15 +261,15 @@ def journey_callers(graph: dict, target: str) -> list[str]:
 
 
 def blast_radius(graph: dict, target: str) -> list[str]:
-    js = [f"journey:{j}" for j, v in (graph.get("journeys") or {}).items() if target in v["services"]]
+    js = [f"journey:{j}" for j in sorted(analyzer.mapped_journeys(graph, target))]
     return journey_callers(graph, target) + js
 
 
 def template_hypothesis(graph: dict, c: Candidate) -> str:
     deps = journey_callers(graph, c.target)
-    js = [j for j, v in (graph.get("journeys") or {}).items() if c.target in v["services"]]
+    js = sorted(analyzer.mapped_journeys(graph, c.target))
     what = TEMPLATE_FAULT["loss" if c.kind == "loss" else c.fault]
-    head = f"If {c.target} {what} ({c.label})"
+    head = f"If {c.target} {what} ({c.label})" if c.fault != "spike" else f"If the shop {what} ({c.label})"
     if not js:
         return f"{head}, no user journey depends on it; expect no journey to degrade."
     callers = f"callers on those journeys ({', '.join(deps[:6])}) will show errors or higher latency and " if deps else ""

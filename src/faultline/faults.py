@@ -1,9 +1,15 @@
+import os
 import time
 
 import docker
+import httpx
 from docker.errors import APIError, NotFound
 
-FAULTS = ("crash", "delay")
+FAULTS = ("crash", "delay", "spike")
+TRAFFIC = "traffic"
+LOCUST_URL = "http://load-generator:8089"
+REVERT_SPAWN_RATE = 100
+LOCUST_RUNNING = ("running", "spawning")
 NEVER = frozenset(
     {"faultline", "reaper", "prober", "otel-collector", "prometheus", "jaeger", "load-generator"}
 )
@@ -40,7 +46,10 @@ def validate(cfg, fault: str, target: str, duration: float, params: dict) -> dic
     s = cfg.safety
     if fault not in FAULTS:
         raise ValidationError(f"unknown fault {fault!r}; allowed: {', '.join(FAULTS)}")
-    if target in NEVER or target not in s.allow:
+    if fault == "spike":
+        if target != TRAFFIC:
+            raise ValidationError(f"spike only targets {TRAFFIC!r}")
+    elif target in NEVER or target not in s.allow:
         raise ValidationError(f"target {target!r} is not in the allowlist")
     if fault == "crash" and target in s.crash_exclude:
         raise ValidationError(f"target {target!r} may not be crashed")
@@ -58,16 +67,61 @@ def validate(cfg, fault: str, target: str, duration: float, params: dict) -> dic
         if not 0 <= loss <= s.max_loss_pct:
             raise ValidationError(f"loss_pct must be 0..{s.max_loss_pct}")
         out.update(delay_ms=d, jitter_ms=j, loss_pct=loss, ttl_s=duration + s.expiry_margin_s)
+    if fault == "spike":
+        try:
+            users = int(params.get("users", 50))
+            rate = float(params.get("spawn_rate", 25))
+        except (TypeError, ValueError):
+            raise ValidationError("users and spawn_rate must be numbers")
+        if not 1 <= users <= s.max_spike_users:
+            raise ValidationError(f"users must be 1..{s.max_spike_users}")
+        if not 1 <= rate <= s.max_spike_users:
+            raise ValidationError(f"spawn_rate must be 1..{s.max_spike_users}")
+        out.update(users=users, spawn_rate=rate)
     return out
 
 
 def initial_revert(fault: str, target: str) -> dict:
-    return {"action": "start_container" if fault == "crash" else "clear_netem", "target": target}
+    action = {"crash": "start_container", "spike": "restore_users"}.get(fault, "clear_netem")
+    return {"action": action, "target": target}
+
+
+class LocustError(RuntimeError):
+    pass
+
+
+class LocustClient:
+    """Locust web API of the load generator: read the user count, set a new one."""
+
+    def __init__(self, base_url: str | None = None, transport=None, timeout: float = 5.0):
+        self.http = httpx.Client(
+            base_url=(base_url or os.environ.get("FAULTLINE_LOCUST_URL", LOCUST_URL)).rstrip("/"),
+            transport=transport, timeout=timeout,
+        )
+
+    def stats(self) -> dict:
+        try:
+            r = self.http.get("/stats/requests")
+            r.raise_for_status()
+            d = r.json()
+            return {"state": str(d["state"]), "user_count": int(d["user_count"])}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            raise LocustError(f"locust stats failed: {type(e).__name__}") from e
+
+    def swarm(self, users: int, spawn_rate: float):
+        try:
+            r = self.http.post("/swarm", data={"user_count": str(int(users)), "spawn_rate": f"{spawn_rate:g}"})
+            r.raise_for_status()
+            if r.json().get("success") is not True:
+                raise LocustError("locust refused swarm")
+        except (httpx.HTTPError, ValueError, AttributeError) as e:
+            raise LocustError(f"locust swarm failed: {type(e).__name__}") from e
 
 
 class DockerDriver:
-    def __init__(self, client=None):
+    def __init__(self, client=None, locust: LocustClient | None = None):
         self.client = client or docker.from_env()
+        self.locust = locust or LocustClient()
 
     def _target(self, name):
         return self.client.containers.get(name)
@@ -80,8 +134,25 @@ class DockerDriver:
         except NotFound:
             return False
 
+    def snapshot(self, entry: dict) -> dict | None:
+        """State to restore, read before anything is applied; stored in the ledger first."""
+        if entry["kind"] != "spike":
+            return None
+        st = self.locust.stats()
+        if st["state"] not in LOCUST_RUNNING or st["user_count"] < 1:
+            raise LocustError(f"locust is not running users (state {st['state']}, users {st['user_count']})")
+        return {**entry["revert"], "users": st["user_count"]}
+
     def apply(self, entry: dict) -> dict:
         kind, target = entry["kind"], entry["target"]
+        if kind == "spike":
+            p, base = entry["params"], entry["revert"].get("users")
+            if base is None:
+                raise LocustError("no stored user count")
+            if p["users"] <= base:
+                raise LocustError(f"spike of {p['users']} users does not exceed the current {base}")
+            self.locust.swarm(p["users"], p["spawn_rate"])
+            return entry["revert"]
         if kind == "crash":
             c = self._target(target)
             policy = c.attrs["HostConfig"].get("RestartPolicy") or {"Name": "", "MaximumRetryCount": 0}
@@ -119,7 +190,11 @@ class DockerDriver:
 
     def revert(self, entry: dict):
         kind, target = entry["kind"], entry["target"]
-        if kind == "crash":
+        if kind == "spike":
+            users = entry["revert"].get("users")
+            if users is not None:
+                self.locust.swarm(users, REVERT_SPAWN_RATE)
+        elif kind == "crash":
             try:
                 c = self._target(target)
             except NotFound:
@@ -136,8 +211,19 @@ class DockerDriver:
         else:
             raise ValueError(f"unknown fault kind {kind}")
 
-    def verify(self, entry: dict) -> bool:
+    def verify(self, entry: dict, timeout: float = 8.0) -> bool:
         kind, target = entry["kind"], entry["target"]
+        if kind == "spike":
+            users = entry["revert"].get("users")
+            if users is None:
+                return True
+            end = time.time() + timeout
+            while True:
+                if self.locust.stats()["user_count"] <= users:
+                    return True
+                if time.time() >= end:
+                    return False
+                time.sleep(0.5)
         if kind == "crash":
             return self.is_running(target)
         if kind == "delay":

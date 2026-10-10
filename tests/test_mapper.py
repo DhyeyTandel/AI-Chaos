@@ -84,7 +84,13 @@ def test_edges_from_traces_and_journeys():
 def test_journey_of_path():
     assert m.journey_of_path("/") == "home" and m.journey_of_path("/api/products") == "home"
     assert m.journey_of_path("/api/products/OLJCESPC7Z") == "product"
+    assert m.journey_of_path("/api/recommendations") == "product"
     assert m.journey_of_path("/other") is None
+
+
+def test_product_journey_includes_recommendation():
+    assert "recommendation" in m.STATIC_JOURNEYS["product"]
+    assert "recommendation" not in m.STATIC_JOURNEYS["home"]
 
 
 def test_mermaid():

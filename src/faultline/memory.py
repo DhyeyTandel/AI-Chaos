@@ -9,16 +9,17 @@ PROMPT_MAX = 20
 
 
 def level(kind: str, params: dict) -> float:
-    """Comparable fault intensity: delay_ms, loss_pct, or infinity for a crash."""
+    """Comparable fault intensity: delay_ms, loss_pct, users, or infinity for a crash."""
     if kind == "crash":
         return math.inf
-    return float((params or {}).get("loss_pct" if kind == "loss" else "delay_ms", 0) or 0)
+    key = {"loss": "loss_pct", "spike": "users"}.get(kind, "delay_ms")
+    return float((params or {}).get(key, 0) or 0)
 
 
 def _fmt(kind: str, v: float | None) -> str:
     if kind == "crash" or v is None:
         return "crash"
-    return f"{v:g} %" if kind == "loss" else f"{v:g} ms"
+    return f"{v:g} {'%' if kind == 'loss' else 'users' if kind == 'spike' else 'ms'}"
 
 
 def enabled(cfg) -> bool:

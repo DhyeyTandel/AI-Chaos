@@ -6,7 +6,7 @@ Built for the Bosch hackathon "AI-Driven Chaos Engineering for Cloud-Native Resi
 
 ## What it does
 
-1. **Map.** Builds a service dependency map from the Compose files plus live Jaeger traces, and derives four user journeys (home, product, cart, checkout). Flags dependencies seen only in traces or only in config.
+1. **Map.** Builds a service dependency map from the Compose files plus live Jaeger traces, and derives four user journeys (home, product, cart, checkout; the product journey also loads recommendations). Flags dependencies seen only in traces or only in config.
 2. **Plan.** Scores every candidate fault deterministically (fan-in, journeys affected, stateful, untested, recent results, severity). The planner remembers across runs the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose it again. An LLM ranks the top 8 with a reason, a hypothesis and a predicted blast radius. A validator rejects unsafe picks, and the safety agent reviews the pick before injection (approve, reduce or veto).
 3. **Inject safely.** Container crashes and network delay, jitter and packet loss, each recorded in a write-ahead ledger before being applied, watched every second, and reverted automatically.
 4. **Observe.** A prober runs the four journeys continuously against a measured baseline. Recovery time is measured after each revert.
@@ -68,7 +68,7 @@ All commands run as `docker compose run --rm faultline <command>`.
 | `probe --seconds N` | Run the journey prober and print per-journey success and latency |
 | `map` | Build the dependency map and journeys, print hidden-dependency candidates and a Mermaid graph |
 | `baseline [--seconds N] [--warmup N] [--show]` | Measure steady state and derive watchdog thresholds |
-| `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]` | One guarded fault: pre-flight safety review, then watchdog, revert and recovery measurement |
+| `experiment --fault crash\|delay --target SVC --duration S [--delay-ms] [--jitter-ms] [--loss-pct]`, or `experiment --fault spike --duration S [--users N] [--spawn-rate R]` | One guarded fault: pre-flight safety review, then watchdog, revert and recovery measurement |
 | `plan [--top N]` | Rank candidate faults and validate the pick, without running it; lists candidates excluded by learned limits |
 | `run [--rounds N] [--report]` | Autonomous loop: plan, validate, execute, record, climb the risk ladder (1 to 8 rounds, default 3) |
 | `runs show [RUN_ID]` | Print a stored run with hypotheses, pre-flight reviews, vetoes, exclusions and safety-agent decisions |
@@ -97,10 +97,10 @@ Faults are never applied without these layers in place. Each is independent of t
 |---|---|
 | Preflight | Refuses to start unless the system is within baseline thresholds |
 | Target allowlist | Only listed application services are targetable; observability and tooling never are; `frontend-proxy` cannot be crashed |
-| Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 % |
+| Parameter caps | Max duration 120 s, delay 2000 ms, jitter 500 ms, loss 30 %, spike 150 users |
 | Write-ahead ledger | The fault is recorded in SQLite before it is applied, so anything left over can be found and reverted |
 | Watchdog | Every 1 s, judges each journey against thresholds derived from the baseline (error rate and p95, with floors in `faultline.toml`); aborts on breach, or if no samples arrive for 5 s |
-| Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |
+| Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss, spike users or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |
 | Cross-run planner memory | The lowest intensity per target and fault kind that the watchdog or safety agent aborted in the last 7 days is never proposed again (`[planner.memory]`). Aborts by the operator, preflight, inject or system are ignored |
 | Safety agent | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
@@ -116,7 +116,7 @@ Crashes hold the container restart policy at `no` during the fault and restore i
 | Container crash | Stop container; restart policy held at `no`, restored after | Implemented |
 | Network delay and jitter | `tc netem` from a `nicolaka/netshoot` sidecar in the target's network namespace | Implemented |
 | Packet loss | Same sidecar, netem loss | Implemented |
-| Traffic spike | Locust UI or API | Manual (not driven by the planner) |
+| Traffic spike (`spike`) | Locust web API of the load generator: the user count is read and stored in the ledger, then `POST /swarm` ramps to `--users`; revert restores the stored count. Target is the whole shop (`traffic`), capped by `max_spike_users` | Implemented |
 | Full disk | | Future work |
 | Database overload | | Future work |
 
@@ -153,7 +153,7 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Area | Status |
 |---|---|
 | Dependency mapper, baseline, prober | Done |
-| Crash, delay, jitter and loss faults | Done |
+| Crash, delay, jitter, loss and traffic-spike faults | Done |
 | Ledger, watchdog, kill switch, reaper, netem expiry | Done, tested live |
 | Planner, validator, risk ladder, autonomous run | Done |
 | Analyst, fixer, resilience score, Markdown/HTML/JSON report | Done |
@@ -165,7 +165,6 @@ From live runs on a Codespace-sized host (see `reports/sample/` for a full repor
 | Dashboard | Future |
 | Combined (multi-fault) failures | Future |
 | Full-disk and database-overload faults | Future |
-| Planner-driven traffic spikes | Future |
 
 ## Repository layout
 

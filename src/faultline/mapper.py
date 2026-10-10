@@ -12,7 +12,7 @@ ENV_SUFFIXES = ("_ADDR", "_HOST")
 
 STATIC_JOURNEYS = {
     "home": ["frontend-proxy", "frontend", "product-catalog", "currency", "astronomy-db"],
-    "product": ["frontend-proxy", "frontend", "product-catalog", "currency", "astronomy-db"],
+    "product": ["frontend-proxy", "frontend", "product-catalog", "currency", "astronomy-db", "recommendation"],
     "cart": ["frontend-proxy", "frontend", "cart", "valkey-cart", "product-catalog", "currency"],
     "checkout": [
         "frontend-proxy", "frontend", "checkout", "cart", "valkey-cart", "product-catalog",
@@ -104,7 +104,7 @@ def _url_path(value: str) -> str:
 def journey_of_path(path: str) -> str | None:
     if path in ("/", "/api/products"):
         return "home"
-    if path.startswith("/api/products/"):
+    if path.startswith("/api/products/") or path == "/api/recommendations":
         return "product"
     if path == "/api/cart":
         return "cart"

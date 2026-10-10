@@ -19,6 +19,11 @@ class Injector:
         entry_id = self.ledger.create(experiment_id, fault, target, params, faults.initial_revert(fault, target), expires)
         entry = self.ledger.get(entry_id)
         try:
+            snapshot = getattr(self.driver, "snapshot", None)
+            pre = snapshot(entry) if snapshot else None
+            if pre is not None:
+                self.ledger.set_revert(entry_id, pre)
+                entry = self.ledger.get(entry_id)
             revert = self.driver.apply(entry)
         except Exception:
             self.revert(entry_id)

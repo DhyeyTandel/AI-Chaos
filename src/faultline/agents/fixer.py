@@ -129,6 +129,14 @@ def fallback_fix(graph: dict, w: Weakness, kind: str) -> Fix:
             weakness_rank=w.rank, fix_title=f"Absorb a {svc} crash", fix_type="architecture" if role in ("store", "broker", "entry") else "config",
             steps=steps, compose_override=restart, expected_effect="Faster recovery and fewer failed requests while the service restarts.", source="fallback",
         )
+    if kind == "spike":
+        return Fix(
+            weakness_rank=w.rank, fix_title="Absorb a traffic surge", fix_type="architecture",
+            steps="Run more replicas of the services on the slowest journey, add rate limiting or load shedding at the front proxy, "
+                  "and set connection and queue limits so a surge degrades gracefully instead of failing requests.",
+            compose_override=None, expected_effect="Journey p95 and error rate stay near baseline while traffic is several times higher.",
+            source="fallback",
+        )
     steps = (
         f"Set a short client timeout and a circuit breaker on calls to {svc}, add a bounded retry with jitter, and serve a cached or "
         f"degraded response when it is slow, so latency does not propagate up the journey."
@@ -176,7 +184,7 @@ def fix(cfg, store, analysis: dict, graph: dict, weaknesses: list[Weakness], cha
     for w in weaknesses:
         if w.rank not in fixes:
             kinds = [by_id[i]["kind"] for i in w.related_experiment_ids if i in by_id]
-            fixes[w.rank] = fallback_fix(graph, w, "crash" if "crash" in kinds else "delay")
+            fixes[w.rank] = fallback_fix(graph, w, "crash" if "crash" in kinds else "spike" if "spike" in kinds else "delay")
             filled += 1
     return FixerResult(
         fixes=[fixes[r] for r in sorted(fixes)], fallback=llm_n == 0, fallback_reason=meta["error"] if llm_n == 0 else None,

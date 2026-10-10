@@ -86,7 +86,11 @@ class Prober:
         return await self._req("GET", "/api/products", params={"currencyCode": CURRENCY})
 
     async def _product(self):
-        return await self._req("GET", f"/api/products/{PRODUCT_ID}", params={"currencyCode": CURRENCY})
+        await self._req("GET", f"/api/products/{PRODUCT_ID}", params={"currencyCode": CURRENCY})
+        return await self._req(
+            "GET", "/api/recommendations",
+            params={"productIds": PRODUCT_ID, "sessionId": USER_ID, "currencyCode": CURRENCY},
+        )
 
     async def _cart(self):
         await self._add_item()

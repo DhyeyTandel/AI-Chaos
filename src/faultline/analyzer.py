@@ -3,6 +3,7 @@ import math
 import re
 
 from . import baseline as bl
+from .faults import TRAFFIC
 
 SPACES = {"\u202f": " ", "\u00a0": " "}
 HYPHENS = {"\u2013": "-", "\u2011": "-", "\u2012": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
@@ -38,8 +39,8 @@ def clamp(x: float) -> float:
 
 
 def fault_kind(fault: str, params: dict) -> str:
-    if fault == "crash":
-        return "crash"
+    if fault in ("crash", "spike"):
+        return fault
     return "loss" if (params or {}).get("loss_pct", 0) else "delay"
 
 
@@ -47,6 +48,8 @@ def fault_label(fault: str, params: dict) -> str:
     k = fault_kind(fault, params)
     if k == "crash":
         return "crash"
+    if k == "spike":
+        return f"spike {params.get('users', 0):g} users"
     if k == "loss":
         return f"loss {params.get('loss_pct', 0):g}%"
     return f"delay {params.get('delay_ms', 0):g}ms"
@@ -74,10 +77,16 @@ def breached(v: dict, th: dict | None) -> bool:
     return v.get("p95_ms") is not None and v["p95_ms"] > th["p95_max_ms"]
 
 
+def mapped_journeys(graph: dict, target: str) -> set[str]:
+    """Journeys the map says depend on the target; a traffic spike hits all of them."""
+    js = graph.get("journeys") or {}
+    return set(js) if target == TRAFFIC else {j for j, v in js.items() if target in v["services"]}
+
+
 def predicted_journeys(graph: dict, target: str, blast: list[str]) -> tuple[set[str], set[str]]:
     """(prediction, map): journeys the hypothesis names, journeys the map says depend on the target."""
     known = set((graph.get("journeys") or {}))
-    mapped = {j for j, v in (graph.get("journeys") or {}).items() if target in v["services"]}
+    mapped = mapped_journeys(graph, target)
     named = {b.split(":", 1)[1] if b.startswith("journey:") else b for b in blast or []} & known
     return (named or mapped), mapped
 
@@ -175,7 +184,7 @@ def load_experiments(store, run_id: str, rounds: list[dict], until: float | None
 
 
 def service_weight(graph: dict, target: str, items: list[dict]) -> int:
-    mapped = sum(1 for v in (graph.get("journeys") or {}).values() if target in v["services"])
+    mapped = len(mapped_journeys(graph, target))
     seen = max((len(a["affected_journeys"]) for a in items), default=0)
     return max(1, mapped, seen)
 

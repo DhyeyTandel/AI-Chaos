@@ -77,7 +77,7 @@ def run_plan(cfg, graph_map: dict, store, top_k: int | None = None, chat=None) -
     return build_graph(cfg, graph_map, store, chat).invoke({"top_k": top_k or cfg.planner.top_k})
 
 
-TIER_LEGEND = "tier 1 light delay or crash of an off-journey service; 2 delay 300ms, loss, crash with partial journey impact; 3 crash of a journey-critical or stateful service"
+TIER_LEGEND = "tier 1 light delay or crash of an off-journey service; 2 delay 300ms, loss, traffic spike, crash with partial journey impact; 3 crash of a journey-critical or stateful service"
 
 
 def strategy_text(cfg, state: RunState) -> str:

@@ -273,15 +273,25 @@ def _run_experiment(store, cfg, fault, target, duration, params, context=None, g
 
 @app.command()
 def experiment(
-    fault: str = typer.Option(..., "--fault", help="crash | delay"),
-    target: str = typer.Option(..., "--target"),
+    fault: str = typer.Option(..., "--fault", help="crash | delay | spike"),
+    target: str = typer.Option(None, "--target", help="service; spike always targets the whole shop (traffic)"),
     duration: int = typer.Option(..., "--duration", min=1),
     delay_ms: float = typer.Option(200, "--delay-ms"),
     jitter_ms: float = typer.Option(0, "--jitter-ms"),
     loss_pct: float = typer.Option(0, "--loss-pct"),
+    users: int = typer.Option(50, "--users", help="spike: Locust users to ramp to"),
+    spawn_rate: float = typer.Option(25, "--spawn-rate", help="spike: users started per second"),
 ):
     """Run one guarded fault injection with watchdog, revert, and recovery measurement."""
     cfg = load_config()
+    if fault == "spike":
+        target = target or faults.TRAFFIC
+        params = {"users": users, "spawn_rate": spawn_rate}
+    else:
+        if not target:
+            console.print("rejected: --target is required", markup=False)
+            raise typer.Exit(2)
+        params = {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct}
     store = Store()
     context = gmap = None
     try:
@@ -289,7 +299,7 @@ def experiment(
         context = safety_mod.context_from_map(gmap, target)
     except Exception:
         pass
-    e = _run_experiment(store, cfg, fault, target, duration, {"delay_ms": delay_ms, "jitter_ms": jitter_ms, "loss_pct": loss_pct}, context, gmap, review=True)
+    e = _run_experiment(store, cfg, fault, target, duration, params, context, gmap, review=True)
     _print_experiment(e)
     raise typer.Exit(0 if e["state"] == "COMPLETED" else 1)
 

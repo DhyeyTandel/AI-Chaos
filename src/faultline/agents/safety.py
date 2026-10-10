@@ -225,15 +225,15 @@ REVIEW_SYSTEM = (
     "and may only make the experiment safer or stop it. You get the planned fault, its tier (1 light to 3 critical), the hypothesis "
     "with its predicted blast radius, the baseline and abort limits of each user journey, known limits (intensities earlier runs "
     "aborted), and recent outcomes on this target and its neighbours. Answer approve when the experiment looks survivable. "
-    "Answer reduce when a lower intensity is clearly safer and still informative: you may only lower delay_ms, loss_pct or duration_s "
+    "Answer reduce when a lower intensity is clearly safer and still informative: you may only lower delay_ms, loss_pct, users or duration_s "
     "(duration at least 10 s); a crash can only get a shorter duration. Answer veto only when the experiment is very likely to breach "
     "the limits or repeats a known abort. Reply with one JSON object and nothing else: "
     '{"decision":"approve|reduce|veto","reason":"<=200 chars, cite numbers from the input","reduced_params":{"delay_ms":100}}. '
     "Give reduced_params only for reduce, with only the keys you lower. Use plain ASCII punctuation, no em dashes."
 )
 MIN_DURATION_S = 10
-PARAM_KEYS = ("delay_ms", "jitter_ms", "loss_pct")
-REDUCIBLE = {"crash": ("duration_s",), "delay": ("delay_ms", "duration_s"), "loss": ("loss_pct", "duration_s")}
+PARAM_KEYS = ("delay_ms", "jitter_ms", "loss_pct", "users", "spawn_rate")
+REDUCIBLE = {"crash": ("duration_s",), "delay": ("delay_ms", "duration_s"), "loss": ("loss_pct", "duration_s"), "spike": ("users", "duration_s")}
 RECENT = 5
 
 
@@ -261,7 +261,7 @@ def apply_reduction(cfg, fault: str, target: str, duration: float, params: dict,
             continue
         if key == "duration_s" and v < MIN_DURATION_S:
             raise Rejected(f"duration below {MIN_DURATION_S} s")
-        if key == "delay_ms" and v < 1 or key == "loss_pct" and v <= 0:
+        if key in ("delay_ms", "users") and v < 1 or key == "loss_pct" and v <= 0:
             raise Rejected(f"{key} {v:g} out of range")
         lowered = True
         if key == "duration_s":
@@ -370,7 +370,7 @@ def preflight_review(cfg, store, base, fault, target, duration, params, tier=Non
 def _changes(rec: dict) -> str:
     a, b = rec["original"], rec["final"]
     parts = []
-    for k, unit in (("delay_ms", "ms"), ("loss_pct", "%")):
+    for k, unit in (("delay_ms", "ms"), ("loss_pct", "%"), ("users", "users")):
         if a["params"].get(k) != b["params"].get(k) and k in a["params"]:
             parts.append(f"{k.split('_')[0]} {a['params'][k]:g} -> {b['params'][k]:g} {unit}")
     if a["duration_s"] != b["duration_s"]:
