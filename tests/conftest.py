@@ -32,6 +32,28 @@ class FakeDriver:
         self.reverts = 0
         self.fail_revert = 0
         self.owned = []
+        self.unverified = set()
+        self.states = {}
+        self.events = []
+        self.restarted = []
+        self.checked = []
+
+    def check_applied(self, entry, spike_fraction=0.8):
+        self.checked.append(entry["kind"])
+        ok = entry["id"] in self.applied and entry["kind"] not in self.unverified
+        return ok, f"fake {entry['kind']} {'in effect' if ok else 'not in effect'}"
+
+    def check_reverted(self, entry):
+        return entry["id"] not in self.applied, "fake revert check"
+
+    def container_states(self, names):
+        return [{"name": n, **{"state": "running", "health": "none", "restarts": 0, "oom": False}, **self.states.get(n, {})} for n in names]
+
+    def recent_events(self, names, since, limit=20):
+        return list(self.events)
+
+    def restart_container(self, name):
+        self.restarted.append(name)
 
     def apply(self, entry):
         self.applied.add(entry["id"])

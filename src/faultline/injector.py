@@ -82,6 +82,20 @@ class Injector:
     def revert_experiment(self, experiment_id: str, wait_s: float = 30.0) -> dict[int, str]:
         return self._revert_open(wait_s, experiment_id)
 
+    def reapply_revert(self, experiment_id: str) -> dict[int, str]:
+        """Run the stored revert again for this experiment's own entries and check it; ledger states are not changed."""
+        out: dict[int, str] = {}
+        for e in self.ledger.all():
+            if e["experiment_id"] != experiment_id:
+                continue
+            try:
+                self.driver.revert(e)
+                ok = self.driver.verify(e)
+                out[e["id"]] = "verified" if ok else "verify failed"
+            except Exception as ex:
+                out[e["id"]] = f"error {type(ex).__name__}: {str(ex)[:80]}"
+        return out
+
     def _revert_open(self, wait_s: float, experiment_id: str | None) -> dict[int, str]:
         results: dict[int, str] = {}
         deadline = time.time() + wait_s

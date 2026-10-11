@@ -240,6 +240,73 @@ class DockerDriver:
             return not self._netem_active(target) and not self._sidecars(entry["id"])
         return False
 
+    def check_applied(self, entry: dict, spike_fraction: float = 0.8) -> tuple[bool, str]:
+        """One look at whether an applied fault is in effect: (ok, detail). The caller polls."""
+        kind, target = entry["kind"], entry["target"]
+        if kind == "spike":
+            want = entry["params"]["users"]
+            have = self.locust.stats()["user_count"]
+            return have >= spike_fraction * want, f"locust users {have} of {want}"
+        if kind == "crash":
+            running = self.is_running(target)
+            return not running, f"{target} {'still running' if running else 'not running'}"
+        if kind == "delay":
+            cs = self._sidecars(entry["id"])
+            if not cs or cs[0].status != "running":
+                return False, "netem sidecar not running"
+            active = self._netem_active(target)
+            return active, f"netem {'present' if active else 'missing'} in {target} netns, sidecar running"
+        return False, f"unknown fault kind {kind}"
+
+    def check_reverted(self, entry: dict) -> tuple[bool, str]:
+        kind, target = entry["kind"], entry["target"]
+        if kind == "spike":
+            users = entry["revert"].get("users")
+            if users is None:
+                return True, "no stored user count"
+            have = self.locust.stats()["user_count"]
+            return have <= users + SPIKE_REVERT_TOLERANCE, f"locust users {have}, original {users}"
+        if kind == "crash":
+            running = self.is_running(target)
+            return running, f"{target} {'running' if running else 'not running'}"
+        if kind == "delay":
+            active = self._netem_active(target)
+            left = len(self._sidecars(entry["id"]))
+            return not active and not left, f"netem {'present' if active else 'gone'}, {left} sidecars"
+        return False, f"unknown fault kind {kind}"
+
+    def container_states(self, names: list[str]) -> list[dict]:
+        out = []
+        for n in names:
+            try:
+                c = self._target(n)
+                c.reload()
+            except NotFound:
+                out.append({"name": n, "state": "missing", "health": "none", "restarts": 0, "oom": False})
+                continue
+            st = c.attrs.get("State", {})
+            out.append({
+                "name": n, "state": st.get("Status", "unknown"), "health": (st.get("Health") or {}).get("Status", "none"),
+                "restarts": int(c.attrs.get("RestartCount", 0)), "oom": bool(st.get("OOMKilled", False)),
+            })
+        return out
+
+    def recent_events(self, names: list[str], since: float, limit: int = 20) -> list[str]:
+        out = []
+        try:
+            for ev in self.client.events(
+                since=int(since), until=int(time.time()), decode=True,
+                filters={"type": "container", "event": ["die", "kill", "stop", "start", "restart", "oom", "health_status"], "container": list(names)},
+            ):
+                a = (ev.get("Actor") or {}).get("Attributes") or {}
+                out.append(f"{time.strftime('%H:%M:%S', time.localtime(ev.get('time', 0)))} {ev.get('Action', '?')} {a.get('name', '?')}")
+        except Exception as e:
+            out.append(f"events unavailable: {type(e).__name__}")
+        return out[-limit:]
+
+    def restart_container(self, name: str):
+        self._target(name).restart(timeout=10)
+
     def list_owned(self) -> list[dict]:
         out = []
         for c in self.client.containers.list(all=True, filters={"label": f"{OWNED_LABEL}=true"}):

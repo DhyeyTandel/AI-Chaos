@@ -9,7 +9,7 @@ from . import baseline as bl
 from . import analyzer, combo, faults, watchdog
 from .injector import Injector
 from .ledger import REVERTED, Ledger
-from .agents import safety
+from .agents import injection, recovery as recovery_agent, safety
 from .prober import run_probe
 from .store import Store, default_db_path
 
@@ -45,6 +45,8 @@ def get(store, exp_id) -> dict:
     r["impact"] = json.loads(r["impact"]) if r["impact"] else None
     r["safety_decisions"] = json.loads(r["safety_decisions"]) if r["safety_decisions"] else []
     r["preflight_review"] = json.loads(r["preflight_review"]) if r["preflight_review"] else None
+    r["injection"] = json.loads(r["injection"]) if r.get("injection") else None
+    r["recovery_agent"] = json.loads(r["recovery_agent"]) if r.get("recovery_agent") else None
     return r
 
 
@@ -113,13 +115,17 @@ async def run_experiment(
             ledger.beat(exp_id)
             await asyncio.sleep(cfg.reaper.heartbeat_s)
 
-    total_cap = cfg.preflight.probe_s + duration + cfg.recovery.cap_s + 60
+    ra = cfg.recovery_agent
+    agent_s = ra.max_actions * (ra.settle_s + ra.remeasure_s + ra.timeout_s + 10) if ra.enabled else 0
+    total_cap = cfg.preflight.probe_s + duration + cfg.recovery.cap_s + 60 + agent_s
     probe_stop = asyncio.Event()
     probe_task = asyncio.create_task(
         run_probe(store, total_cap, timeout=cfg.watchdog.probe_timeout_s, stop=probe_stop)
     )
     beat_task = asyncio.create_task(beat())
     state, reason, recovery = "ABORTED", None, None
+    inj_rec = ra_rec = None
+    t_apply = None
     not_measured = False
     source = None
     monitor = None
@@ -149,14 +155,14 @@ async def run_experiment(
             _update(store, exp_id, state="INJECTING")
             log(f"[{exp_id}] INJECTING {analyzer.fault_label(fault, params) if is_combo else fault + ' on ' + target} for {duration}s")
             try:
-                if is_combo:
-                    await asyncio.to_thread(
-                        lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject_combo(exp_id, params, duration))
-                    )
-                else:
-                    await asyncio.to_thread(
-                        lambda: _with_injector(db_path, driver, cfg, lambda inj, s: inj.inject(exp_id, fault, target, params, duration))
-                    )
+                spec = injection.prepare(cfg, fault, target, params, duration)
+                t_apply = time.time()
+                inj_rec = await asyncio.to_thread(injection.inject, db_path, driver, cfg, exp_id, spec)
+                log(f"[{exp_id}] {injection.describe(inj_rec)}")
+            except injection.NotVerified as e:
+                inj_rec = e.record
+                reason, source = f"injection not verified: {e}", "inject"
+                log(f"[{exp_id}] {injection.describe(inj_rec)}")
             except Exception as e:
                 reason, source = f"inject failed: {type(e).__name__}: {e}", "inject"
         if reason is None:
@@ -166,7 +172,7 @@ async def run_experiment(
             wd = watchdog.Watchdog(live, cfg, t_inject)
             monitor = safety.Monitor(cfg, db_path, {**base, "thresholds": live}, fault, target, params, duration, context, t_inject, chat=chat, log=lambda m: log(f"[{exp_id}] {m}"))
             monitor.start()
-            while time.time() - t_inject < duration:
+            while time.time() < t_apply + duration:
                 await asyncio.sleep(cfg.watchdog.interval_s)
                 now = time.time()
                 if stop.is_set():
@@ -202,6 +208,18 @@ async def run_experiment(
                     recovery = now - t_revert
                     break
         not_measured = recovery is None and stop.is_set() and not bad
+        if t_inject is not None and not bad:
+            if recovery is not None or not_measured:
+                ra_rec = recovery_agent.settled(store, exp_id, recovery, not not_measured)
+            else:
+                log(f"[{exp_id}] RECOVERY FAILED: not back in the baseline band after {cfg.recovery.cap_s}s")
+                ra_rec = await recovery_agent.remediate(recovery_agent.Ctx(
+                    cfg=cfg, store=store, driver=driver, exp=get(store, exp_id), graph=graph, thresholds=thresholds, base=base,
+                    t_revert=t_revert, stop=stop, stop_path=sp, t_inject=t_inject, chat=chat, log=lambda m: log(f"[{exp_id}] {m}"),
+                ))
+                if ra_rec["final_recovery_s"] is not None:
+                    recovery = ra_rec["final_recovery_s"]
+            log(f"[{exp_id}] {recovery_agent.describe(ra_rec)}")
         state = "COMPLETED" if reason is None else "ABORTED"
     finally:
         probe_stop.set()
@@ -227,6 +245,7 @@ async def run_experiment(
             recovery_measured=None if t_inject is None else 0 if not_measured else 1,
             abort_source=source if state == "ABORTED" else None, safety_checks=len(checks),
             safety_decisions=json.dumps(checks) if checks else None,
+            injection=json.dumps(inj_rec) if inj_rec else None, recovery_agent=json.dumps(ra_rec) if ra_rec else None,
         )
     return get(store, exp_id)
 

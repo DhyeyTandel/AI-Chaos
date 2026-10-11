@@ -232,7 +232,7 @@ def test_fallback_report_renders_all_sections(cfg, store, tmp_path, monkeypatch)
     assert "<script" not in html_text and "prefers-color-scheme:dark" in html_text and "Per-service scores" in html_text
     data = json.loads((tmp_path / "run-test" / "report.json").read_text())
     assert data["overall_score"] == state["data"]["overall_score"] and data["weaknesses"] and data["weaknesses"][0]["fix"]
-    assert {u["agent"] for u in data["ai_usage"]} == {"planner", "safety", "analyst", "fixer"}
+    assert {u["agent"] for u in data["ai_usage"]} == {"planner", "safety", "injection", "recovery", "analyst", "fixer"}
     assert all("fallback" in u["path"] or u["path"] == "not run" for u in data["ai_usage"])
 
 

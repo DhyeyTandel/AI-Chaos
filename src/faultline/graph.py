@@ -5,7 +5,7 @@ from langgraph.graph import END, StateGraph
 
 from . import analyzer, faults, memory, report, runs
 from . import baseline as bl
-from .agents import analyst, fixer, planner, safety, validator
+from .agents import analyst, fixer, injection, planner, safety, validator
 
 
 class PlanState(TypedDict, total=False):
@@ -27,6 +27,7 @@ class RunState(PlanState, total=False):
     excluded: list[str]
     vetoed: list[dict]
     review: dict | None
+    injection: dict | None
     final: planner.Candidate | None
     memory_limits: list[dict]
     memory_excluded: list[dict]
@@ -163,8 +164,22 @@ def build_run_graph(cfg, graph_map: dict, store, runner, settler, control, chat=
         if state.get("stop_reason"):
             return "end"
         if state["selected"] is not None:
-            return "execute"
+            return "inject"
         return "validate" if not _validate_done(cfg, state) else "halt"
+
+    def inject_node(state: RunState) -> RunState:
+        """Injection agent plan step: the approved (possibly reduced) plan becomes a validated injection spec. The apply and the
+        verification run inside the shared experiment runner, under its watchdog, heartbeat and revert."""
+        why = control.reason()
+        if why:
+            return {"stop_reason": why, "injection": None}
+        c = state["final"] or state["selected"].candidate
+        try:
+            spec = injection.prepare(cfg, c.fault, c.target, dict(c.params), c.duration_s)
+        except faults.ValidationError as e:
+            return {"stop_reason": f"experiment rejected: {e}", "injection": None}
+        log(f"round {state['round']}/{state['rounds']}: Injection agent plan: " + ", ".join(p["label"] for p in spec["parts"]))
+        return {"injection": spec}
 
     def execute_node(state: RunState) -> RunState:
         why = control.reason()
@@ -231,13 +246,14 @@ def build_run_graph(cfg, graph_map: dict, store, runner, settler, control, chat=
         return lambda state: "end" if state.get("stop_reason") else nxt
 
     g = StateGraph(RunState)
-    for name, fn in (("plan", plan_node), ("validate", validate_node), ("review", review_node), ("halt", halt_node), ("execute", execute_node),
+    for name, fn in (("plan", plan_node), ("validate", validate_node), ("review", review_node), ("halt", halt_node), ("inject", inject_node), ("execute", execute_node),
                      ("record", record_node), ("settle", settle_node)):
         g.add_node(name, fn)
     g.set_entry_point("plan")
     g.add_conditional_edges("plan", end_if_stopped("validate"), {"validate": "validate", "end": END})
     g.add_conditional_edges("validate", after_validate, {"validate": "validate", "review": "review", "halt": "halt"})
-    g.add_conditional_edges("review", after_review, {"validate": "validate", "execute": "execute", "halt": "halt", "end": END})
+    g.add_conditional_edges("review", after_review, {"validate": "validate", "inject": "inject", "halt": "halt", "end": END})
+    g.add_conditional_edges("inject", end_if_stopped("execute"), {"execute": "execute", "end": END})
     g.add_edge("halt", END)
     g.add_conditional_edges("execute", end_if_stopped("record"), {"record": "record", "end": END})
     g.add_conditional_edges("record", end_if_stopped("settle"), {"settle": "settle", "end": END})

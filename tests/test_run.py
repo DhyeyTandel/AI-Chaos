@@ -185,3 +185,23 @@ def test_db_rows_written(rcfg, store):
     assert r["fallback"] == 1 and r["reason"] and r["hypothesis"] and r["experiment_id"] == "exp-1"
     assert r["fault"] in ("crash", "delay") and isinstance(r["params"], dict) and isinstance(r["predicted_blast_radius"], list)
     assert rows[1]["outcome"] == "ABORTED" and rows[1]["abort_reason"] == "watchdog breach" and rows[0]["recovery_s"] == 2.5
+
+
+def test_inject_node_plans_before_execute(rcfg, store):
+    lines = []
+    plan_graph.run_loop(rcfg, gmap(), store, 1, Script(), lambda: ("ok", ""), Control(), log=lines.append)
+    i = next(n for n, m in enumerate(lines) if "Injection agent plan:" in m)
+    assert "running " in lines[i + 1]
+
+
+def test_inject_node_stops_run_on_invalid_plan(rcfg, store, monkeypatch):
+    from faultline.agents import injection
+    from faultline.faults import ValidationError
+
+    def bad(*a, **k):
+        raise ValidationError("nope")
+
+    monkeypatch.setattr(injection, "prepare", bad)
+    s = Script()
+    run = go(rcfg, store, 2, s)
+    assert run["stop_reason"] == "experiment rejected: nope" and s.calls == []

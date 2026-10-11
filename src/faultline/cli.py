@@ -14,7 +14,7 @@ from . import analyzer, combo as combo_mod, fixes as fixes_mod
 from . import baseline as bl
 from . import docker_api, experiment as exp_mod, faults, graph as plan_graph, mapper, observer, runs as runs_mod
 from .agents import analyst as analyst_mod, fixer as fixer_mod, planner as planner_mod
-from .agents import safety as safety_mod
+from .agents import injection as injection_mod, recovery as recovery_mod, safety as safety_mod
 from . import reaper as reaper_mod
 from .config import load_config
 from .injector import Injector
@@ -236,12 +236,29 @@ def _print_parts(e: dict, store):
         )
 
 
+def _agent_lines(e: dict) -> list[str]:
+    lines = []
+    if e.get("injection"):
+        lines.append(injection_mod.describe(e["injection"]))
+    ra = e.get("recovery_agent")
+    if ra:
+        lines.append(recovery_mod.describe(ra))
+        lines += [f"  step {a['step']}: {a['action']}{' ' + a['service'] if a['service'] else ''}: {a['diagnosis'] or '-'} -> {a['result']}" for a in ra["actions"]]
+    return lines
+
+
+def _print_agent_lines(e: dict, indent: str = ""):
+    for ln in _agent_lines(e):
+        console.print(indent + ln, markup=False, highlight=False)
+
+
 def _print_experiment(e: dict, store=None):
     t = Table("id", "fault", "target", "state", "recovery s", "abort reason")
     rec = e["recovery_seconds"]
+    after = " (after agent)" if (e.get("recovery_agent") or {}).get("initial") == "failed" else ""
     t.add_row(
         e["id"], e["fault"], e["target"], e["state"],
-        "not measured" if rec is None and e.get("recovery_measured") == 0 else "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}"),
+        "not measured" if rec is None and e.get("recovery_measured") == 0 else "never" if rec is None and e["reverted_at"] else _fmt(rec, "{:.1f}") + after,
         e["abort_reason"] or "-",
         style="red" if e["state"] in ("ABORTED", "VETOED") else "green",
     )
@@ -251,6 +268,7 @@ def _print_experiment(e: dict, store=None):
     if e["preflight_review"]:
         console.print(_review_line(e["preflight_review"]), markup=False, highlight=False)
     console.print(_safety_line(e), markup=False, highlight=False)
+    _print_agent_lines(e)
     if e["impact"]:
         it = Table("journey", "n", "err % (fault)", "err % (base)", "p95 ms (fault)", "p95 ms (base)")
         for j, v in e["impact"].items():
@@ -530,7 +548,7 @@ def run_cmd(
             try:
                 return asyncio.run(exp_mod.run_experiment(
                     store, driver, cfg, c.fault, c.target, c.duration_s, dict(c.params),
-                    log=lambda m: console.print(m, markup=False, highlight=False), context=context, review=review,
+                    log=lambda m: console.print(m, markup=False, highlight=False), context=context, review=review, graph=gmap,
                 ))
             except KeyboardInterrupt:
                 console.print("interrupted; reverting", markup=False)
@@ -828,6 +846,7 @@ def runs_show(run_id: str = typer.Argument(None, help="Run id (default: latest)"
         if r["experiment_id"]:
             e = exp_mod.get(store, r["experiment_id"])
             console.print("  " + _safety_line(e), markup=False, highlight=False)
+            _print_agent_lines(e, "  ")
             for c in e["safety_decisions"]:
                 what = f"{c['decision']} ({c['concern']}) {c['reason']}" if c["decision"] else f"ignored ({c['error']})"
                 console.print(f"    t={c['t']:g}s {what} [{c['latency_ms']} ms, {c['tokens']} tok]", markup=False, highlight=False)
@@ -855,7 +874,7 @@ def agents_usage():
     cfg = load_config()
     store = Store()
     used = {r["model"]: r for r in store.usage_all_today()}
-    models = sorted({cfg.llm.planner_model, cfg.llm.analyst_model, cfg.llm.fixer_model, cfg.llm.safety_model} | set(used))
+    models = sorted({cfg.llm.planner_model, cfg.llm.analyst_model, cfg.llm.fixer_model, cfg.llm.safety_model, cfg.llm.recovery_model} | set(used))
     t = Table("model", "requests", "prompt", "completion", "total", "budget", "used %")
     for m in models:
         u = store.usage_today(m)

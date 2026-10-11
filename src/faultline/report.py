@@ -4,10 +4,11 @@ import time
 from pathlib import Path
 
 from . import analyzer, fixes as fixes_mod, memory
-from .agents import safety
+from .agents import injection as injection_agent, safety
 
 MARKER_INPUTS = ("ranking validation", "weakness validation", "fix validation")
-AGENTS = ("planner", "safety", "analyst", "fixer")
+AGENTS = ("planner", "safety", "injection", "recovery", "analyst", "fixer")
+RUN_WINDOW = ("planner", "safety", "injection", "recovery")
 
 CSS = """
 :root{--bg:#fbfaf8;--fg:#1d1b19;--mut:#6a645d;--line:#ddd7cf;--card:#fff;--accent:#c2410c;--crit:#b91c1c;--high:#c2410c;--med:#a16207;--low:#4d7c0f}
@@ -32,7 +33,11 @@ def fmt_rec(a: dict) -> str:
         return "-"
     if not a.get("recovery_measured", True):
         return "not measured"
-    return "never" if a["never_recovered"] else "-" if a["recovery_s"] is None else f"{a['recovery_s']:.1f}s"
+    if a["never_recovered"]:
+        return "never" + (" (agent escalated)" if a.get("recovery_agent") == "escalated" else "")
+    if a["recovery_s"] is None:
+        return "-"
+    return f"{a['recovery_s']:.1f}s" + (" (after agent)" if a.get("initial_recovery_failed") else "")
 
 
 def fmt_ts(t) -> str:
@@ -43,14 +48,20 @@ def ai_usage(store, run: dict, since: float, results: dict) -> list[dict]:
     now = time.time()
     out = []
     for agent in AGENTS:
-        lo, hi = (run["started_at"], run.get("ended_at") or now) if agent in ("planner", "safety") else (since, now)
+        lo, hi = (run["started_at"], run.get("ended_at") or now) if agent in RUN_WINDOW else (since, now)
         rows = [dict(r) for r in store.conn.execute("SELECT * FROM agent_trace WHERE agent = ? AND ts >= ? AND ts <= ? ORDER BY id", (agent, lo, hi + 1))]
+        det = [r for r in rows if r["model"] == "deterministic"]
+        rows = [r for r in rows if r["model"] != "deterministic"]
         real = [r for r in rows if r["input_summary"] not in MARKER_INPUTS]
         groq = [r for r in real if not r["fallback"]]
         fb = [r for r in rows if r["fallback"]]
         models = sorted({r["model"] for r in groq if r["model"]})
         res = results.get(agent)
-        if res is not None:
+        if agent == "injection":
+            path = f"deterministic ({len(det)} injections checked, no LLM)" if det else "not run"
+        elif agent == "recovery" and not rows:
+            path = f"deterministic (no LLM call; {len(det)} records)" if det else "not run"
+        elif res is not None:
             path = f"fallback ({res['reason']})" if res["fallback"] else f"groq {', '.join(models) or res['model']}"
         elif not rows:
             path = "not run"
@@ -68,6 +79,7 @@ def methodology_text(cfg) -> list[str]:
     return [
         "An independent synthetic prober exercises four user journeys (home, product, cart, checkout) through the front proxy every second. It is the ground truth and does not depend on the application's own telemetry.",
         "A baseline run fixes per-journey error rate and p95 latency and derives safety thresholds from them. A watchdog aborts any experiment that breaches a threshold or loses sight of the prober. Before injection, the safety agent reviews the plan against the baseline limits, recent outcomes and the learned limits, and may approve it, reduce its intensity or veto it; it can never raise an intensity. The planner remembers, across runs, the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose that intensity or a higher one again within the lookback window. An advisory safety agent re-checks the live measurements every few seconds and may abort earlier; it can never cancel a watchdog abort, extend a fault or change a threshold.",
+        "The injection agent is deterministic: it applies the approved plan through the ledger and then verifies that each part is really in effect, reverting only its own entries if not. The recovery agent (a small LLM) runs only after the deterministic revert and recovery measurement, and only if the system did not return to baseline; it can restart services from a fixed, guarded menu or escalate to the operator, and it is never used when recovery succeeded.",
         "Each experiment injects one fault (container crash, added network delay, packet loss or a traffic spike), measures every journey during the fault window (up to the abort for aborted runs), reverts the fault, and measures how long the journeys take to return inside the baseline band.",
         f"A declared combined failure injects {cfg.combined.max_parts} faults together as one experiment (one ledger entry per part, one watchdog, one safety review). Every journey limit is tightened for it: p95 limit x{cfg.combined.p95_factor:g}, error-rate limit x{cfg.combined.error_factor:g}. It is scored once, as a whole.",
         "Impact, breadth, recovery and the penalty are computed deterministically from those measurements. The hypothesis verdict compares the journeys the planner predicted would degrade with those that actually did: CONFIRMED when equal, PARTIAL when they overlap, REFUTED when they do not.",
@@ -193,6 +205,7 @@ def blocks(cfg, d: dict) -> list:
               [[a["round"], a["tier"], a["label"], a["target"], cut(a["reason"], 140), cut(a["hypothesis"], 140), a["verdict"],
                 ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}", fmt_rec(a), f"{a['penalty']:.0f}", cut(safety.describe_review(a["preflight"]), 120), safety.describe(a["safety_decisions"]),
                 a["outcome"] + (f" by {a['abort_source']}" if a["abort_source"] else "") + (f" ({cut(a['abort_reason'], 60)})" if a["abort_reason"] else "")] for a in run_exps]))
+    b += agent_blocks(cfg, run_exps)
     combos = [a for a in d["experiments"] if a["combo"]]
     if combos:
         b += combo_blocks(cfg, combos)
@@ -265,6 +278,31 @@ def fix_blocks(items: list[dict]) -> list:
                   ("table", ["Experiment", "Fault", "Target", "Degraded journeys", "Impact", "Breadth", "Recovery", "Penalty", "Outcome"],
                    [[a["experiment_id"], a["label"], a["target"], ", ".join(a["affected_journeys"]) or "none", f"{a['impact']:.2f}", f"{a['breadth']:.2f}",
                      fmt_rec(a), f"{a['penalty']:.0f}", a["outcome"]] for a in x["after"]])]
+    return b
+
+
+def agent_blocks(cfg, exps: list[dict]) -> list:
+    b: list = [("h", 2, "Injection and recovery agents", "")]
+    inj = [a for a in exps if a.get("injection")]
+    b.append(("p", "Injection agent (deterministic, no LLM): after the approved plan is applied, it checks that every part is in effect (netem present in the target's network namespace "
+                   f"with its sidecar running, crashed container not running, Locust users at {cfg.injection.spike_fraction:.0%} or more of the target). "
+                   "An unverified injection reverts only that experiment's own ledger entries and aborts it with source inject."))
+    if inj:
+        b.append(("table", ["Experiment", "Fault", "Verified parts"],
+                  [[a["experiment_id"], a["label"], injection_agent.describe(a["injection"]).removeprefix("Injection agent: ")] for a in inj]))
+    b.append(("p", "Recovery agent: runs only after the deterministic revert and recovery measurement. When the journeys returned to the baseline band it makes no LLM call. "
+                   f"When recovery was measured and failed, it diagnoses from the degraded journeys, the revert checks, container state and Docker events, and may take at most {cfg.recovery_agent.max_actions} actions from a fixed menu "
+                   "(reapply_revert, restart_target, restart_service, kill_switch, escalate). restart_service is limited to allowlisted application services on a degraded journey, never tooling, observability or a data store that is not the experiment's own target. "
+                   "The final measured recovery is used for scoring; the failed first attempt stays listed here."))
+    helped = [a for a in exps if a.get("initial_recovery_failed")]
+    if not helped:
+        b.append(("p", "Every experiment in this run recovered on its own: the recovery agent made no LLM call."))
+    for a in helped:
+        b.append(("p", f"{a['experiment_id']} ({a['label']} on {a['target']}): did not return to the baseline band within {cfg.recovery.cap_s} s of the revert. "
+                       f"Outcome: {a['recovery_agent']}; final recovery {fmt_rec(a)}. {a.get('recovery_note') or ''}"))
+        if a["recovery_actions"]:
+            b.append(("table", ["Step", "Action", "Service", "Diagnosis", "Reason", "Result"],
+                      [[x["step"], x["action"], x["service"] or "-", x["diagnosis"] or "-", x["reason"] or "-", x["result"]] for x in a["recovery_actions"]]))
     return b
 
 

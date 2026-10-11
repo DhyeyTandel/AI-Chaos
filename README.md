@@ -8,8 +8,8 @@ Built for the Bosch hackathon "AI-Driven Chaos Engineering for Cloud-Native Resi
 
 1. **Map.** Builds a service dependency map from the Compose files plus live Jaeger traces, and derives four user journeys (home, product, cart, checkout; the product journey also loads recommendations). Flags dependencies seen only in traces or only in config.
 2. **Plan.** Scores every candidate fault deterministically (fan-in, journeys affected, stateful, untested, recent results, severity). The planner remembers across runs the lowest intensity per target and fault kind that the watchdog or safety agent aborted, and does not propose it again. An LLM ranks the top 8 with a reason, a hypothesis and a predicted blast radius. A validator rejects unsafe picks, and the safety agent reviews the pick before injection (approve, reduce or veto).
-3. **Inject safely.** Container crashes and network delay, jitter and packet loss, each recorded in a write-ahead ledger before being applied, watched every second, and reverted automatically.
-4. **Observe.** A prober runs the four journeys continuously against a measured baseline. Recovery time is measured after each revert.
+3. **Inject safely.** Container crashes and network delay, jitter and packet loss, each recorded in a write-ahead ledger before being applied, then verified to be really in effect by the deterministic injection agent, watched every second, and reverted automatically.
+4. **Observe.** A prober runs the four journeys continuously against a measured baseline. Recovery time is measured after each revert. If the system does not return to baseline, a small recovery agent diagnoses it and may take one of a few guarded actions.
 5. **Report.** An analyst agent ranks weaknesses with evidence, a fixer agent proposes fixes, and a resilience score is computed. Output is `report.md`, `report.html` and `report.json`.
 
 ## Quick start
@@ -105,6 +105,8 @@ Faults are never applied without these layers in place. Each is independent of t
 | Pre-flight safety review | Before injection the safety agent approves, reduces (only lowers delay, loss, spike users or duration; a crash can only get shorter, at least 10 s) or vetoes the planned fault. A reduction is re-checked by the validator and treated as a veto if invalid. A failed or timed-out review approves, because the validator and watchdog still apply |
 | Cross-run planner memory | The lowest intensity per target and fault kind that the watchdog or safety agent aborted in the last 7 days is never proposed again (`[planner.memory]`). Aborts by the operator, preflight, inject or system are ignored. The pre-flight reviewer is shown only watchdog and safety-agent aborts as aborts; an operator stop is shown as "stopped by operator (not a failure)" and preflight, inject and system aborts are left out |
 | Safety agent | Live advisory check about every 10 s; can only abort earlier, never override the watchdog |
+| Injection agent (deterministic) | After the apply, checks that every part is in effect: netem present in the target's network namespace with its sidecar running, crashed container not running, Locust users at 80 % or more of the target within a timeout. If not, reverts only that experiment's own ledger entries and aborts it (source `inject`, reason `injection not verified: ...`) |
+| Recovery agent | Runs only after the deterministic revert and recovery measurement, and only when recovery was measured and failed. At most 2 actions from a fixed menu, each followed by a re-measure; failure, timeout or an invalid answer means escalate (do nothing) |
 | Kill switch | `faultline stop` reverts everything and writes a STOP sentinel that running experiments honour |
 | Reaper | Separate always-on container; reverts faults past expiry, or all faults if the controller heartbeat is older than 10 s (measured live: 13 s) |
 | Self-expiring netem sidecar | The network fault removes its own rule when its TTL ends (verified with both controller and reaper stopped) |
@@ -143,7 +145,7 @@ Crashes hold the container restart policy at `no` during the fault and restore i
 
 ## AI agents
 
-LangGraph pipeline; models are served by Groq's free tier.
+LangGraph pipeline with six agents (Planner, Safety, Injection, Recovery, Analyst, Fixer) plus a rule-based validator; models are served by Groq's free tier.
 
 | Agent | Model | Decides | Fallback without LLM |
 |---|---|---|---|
@@ -152,6 +154,18 @@ LangGraph pipeline; models are served by Groq's free tier.
 | Analyst | `openai/gpt-oss-120b` | Ranks weaknesses with evidence and severity | Penalty-ranked weaknesses |
 | Fixer | `openai/gpt-oss-120b` | Proposes fixes, including validated Compose overrides (applied only by `faultline fix`, and only the restart-policy and raised memory or CPU limit part) | Fallback fixes |
 | Safety agent | `openai/gpt-oss-20b` (reasoning effort low) | Pre-flight review (approve, reduce or veto) before injection; live continue or abort advice during a fault | Review approves; live checks ignored; watchdog verdict stands |
+| Injection agent | none (deterministic) | Nothing to decide: applies the approved plan in safe order through the ledger, then verifies each part took effect; an unverified injection is reverted (own entries only) and aborted | Not an LLM |
+| Recovery agent | `openai/gpt-oss-20b` (reasoning effort low, cache off) | Only after the deterministic rollback and only if recovery was measured and failed: diagnoses the cause and picks one action from the menu below | Escalate: do nothing and tell the operator |
+
+**Injection agent.** It is deterministic and has no model. In `run` it is the `inject` node of the graph, between the pre-flight review and `execute`; `run` and `experiment` share one implementation (`agents/injection.py`), so the verification is identical on both paths. Each applied part is polled until it is seen in effect or its timeout (`[injection]`) passes. The per-part result is stored with the experiment, written to `agent_trace` (agent `injection`, model `deterministic`), printed as `Injection agent: verified ...` and listed in the report.
+
+**Recovery agent.** The rollback itself (revert, verify, reaper, kill switch) is unchanged and deterministic. The agent runs only after it and after the recovery measurement:
+
+- Recovered in the baseline band: no LLM call; `recovered in X s` is recorded (agent `recovery`, model `deterministic`).
+- Not measured (operator stop or kill switch): it does nothing.
+- Measured and failed (not back in the baseline band within `[recovery] cap_s`): it gets a compact input (still-degraded journeys against baseline, a revert check per own ledger entry, state, health and restart count of the target and of the services on the degraded journeys, recent Docker events) and answers with a diagnosis, one action and a reason.
+
+The menu is closed and enforced in code: `reapply_revert` (run this experiment's own revert again and check it), `restart_target` (restart the experiment's own container target), `restart_service` (one allowlisted application service on a degraded journey; never tooling or observability, never `astronomy-db`, `valkey-cart` or `kafka` unless it is this experiment's own target), `kill_switch` (revert everything and leave the STOP sentinel so the run stops), `escalate` (do nothing). At most `max_actions` (2) actions per experiment, each followed by `settle_s` and a new recovery measurement. A call that fails, times out, has no key or returns anything invalid becomes `escalate`, and a clear operator message is printed. Every action is stored in the `recovery_actions` table and in `agent_trace`. The experiment keeps its first failed recovery visible (`Recovery agent: ...` line, report section) while scoring uses the final measured recovery, counted from the original revert; an escalated case stays "never recovered".
 
 The planner climbs a risk ladder: tier 1 (50 ms delays, crashes of services no journey needs), tier 2 (300 ms delay, 10 % loss, partial-impact crashes, core-path delays), tier 3 (critical or stateful crashes, including flagd). It climbs after 2 survived experiments at a tier, and a target that triggers an abort is excluded.
 
@@ -161,7 +175,7 @@ Token budget handling: a per-model limiter (8000 tokens/min), a daily budget per
 
 ## Sample results
 
-From live runs on an 8-core Linux host (see `reports/sample/` for the full report of run-201605-9bf7, 4 rounds, all four agents on Groq):
+From live runs on an 8-core Linux host (see `reports/sample/` for the full report of run-201605-9bf7, 4 rounds, all four LLM agents on Groq):
 
 - **The sample run.** Round 1: a 50 ms delay on flagd was aborted by the Safety agent ("product p95 221 ms > baseline 132 ms, outside predicted blast radius") before any threshold was breached. Rounds 2 and 3: 50 ms delays on frontend-proxy and cart completed, so the ladder climbed to tier 2. Round 4: a 300 ms delay on valkey-cart was aborted by the watchdog at cart p95 2156 ms. Every fault was reverted; recovery took about 5 s each.
 - **Second sample.** `reports/sample-2/` (run-202432-9c92, score 44.6): the Safety review vetoed 10 % loss on product-catalog before injection, then the watchdog aborted a 50 ms delay on product-catalog at product p95 1023 ms.
@@ -183,6 +197,7 @@ From live runs on an 8-core Linux host (see `reports/sample/` for the full repor
 | Analyst, fixer, resilience score, Markdown/HTML/JSON report | Done |
 | Token budget, cache, agent trace | Done |
 | Safety agent (live advisory) | Done (gpt-oss-20b, verified live) |
+| Injection agent (deterministic verification) and recovery agent (guarded remediation) | Done |
 | Pre-flight safety review (approve, reduce, veto) | Done |
 | Cross-run planner memory and learned limits | Done |
 | Fixer auto-apply and re-run (`fix`) | Done (restart policy and raised memory or CPU limit only) |
@@ -199,7 +214,7 @@ faultline.toml          thresholds, safety caps, allowlist, planner, LLM and sco
 map.overrides.yaml      manual corrections to the dependency map
 config/                 OpenTelemetry Collector trim config
 src/faultline/          CLI, mapper, prober, watchdog, injector, ledger, reaper, analyzer, report
-src/faultline/agents/   planner, validator, analyst, fixer, safety
+src/faultline/agents/   planner, validator, analyst, fixer, safety, injection, recovery
 tests/                  test suite
 docs/                   OVERVIEW.md (full design), ARCHITECTURE.md (one-page summary)
 reports/                generated reports; reports/sample/ is a committed example

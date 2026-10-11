@@ -157,6 +157,7 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
     impact = max(deg.values(), default=0.0)
     breadth = len(affected) / total
     measured = recovery_measured(exp)
+    ra = exp.get("recovery_agent") or {}
     rec, never = recovery_norm(cfg, injected, exp.get("reverted_at") is not None, exp.get("recovery_seconds"), measured)
     pen = penalty(cfg, impact, breadth, rec) if injected else 0.0
     hidden = sorted(j for j in affected if j not in pred | mapped and deg[j] >= cfg.score.hidden_min_impact)
@@ -178,6 +179,8 @@ def analyze_experiment(cfg, exp: dict, rnd: dict | None, graph: dict, thresholds
         "hidden_journeys": hidden,
         "abort_source": exp.get("abort_source"), "safety_decisions": exp.get("safety_decisions") or [],
         "preflight": exp.get("preflight_review"),
+        "injection": exp.get("injection"), "recovery_agent": ra.get("outcome"), "initial_recovery_failed": ra.get("initial") == "failed",
+        "recovery_actions": ra.get("actions") or [], "recovery_note": ra.get("note"),
     }
 
 
@@ -198,6 +201,8 @@ def fetch_experiments(store, where, args):
         r["impact"] = json.loads(r["impact"]) if r["impact"] else None
         r["safety_decisions"] = json.loads(r["safety_decisions"]) if r.get("safety_decisions") else []
         r["preflight_review"] = json.loads(r["preflight_review"]) if r.get("preflight_review") else None
+        r["injection"] = json.loads(r["injection"]) if r.get("injection") else None
+        r["recovery_agent"] = json.loads(r["recovery_agent"]) if r.get("recovery_agent") else None
         out.append(r)
     return out
 

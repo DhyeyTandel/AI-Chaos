@@ -138,6 +138,18 @@ CREATE TABLE IF NOT EXISTS fixes (
     details TEXT
 );
 
+CREATE TABLE IF NOT EXISTS recovery_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    service TEXT,
+    reason TEXT,
+    diagnosis TEXT,
+    result TEXT,
+    ts REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS llm_cache (
     key TEXT PRIMARY KEY,
     model TEXT NOT NULL,
@@ -150,7 +162,7 @@ MIGRATIONS = {
     "agent_trace": {"prompt_tokens": "INTEGER", "completion_tokens": "INTEGER"},
     "experiments": {
         "abort_source": "TEXT", "safety_checks": "INTEGER NOT NULL DEFAULT 0", "safety_decisions": "TEXT",
-        "preflight_review": "TEXT", "recovery_measured": "INTEGER",
+        "preflight_review": "TEXT", "recovery_measured": "INTEGER", "injection": "TEXT", "recovery_agent": "TEXT",
     },
     "runs": {"memory": "TEXT"},
     "run_rounds": {"preflight": "TEXT"},
@@ -225,6 +237,17 @@ class Store:
                 )
         except sqlite3.Error:
             pass
+
+    def add_recovery_action(self, experiment_id, step, action, service, reason, diagnosis, result):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO recovery_actions (experiment_id, step, action, service, reason, diagnosis, result, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (experiment_id, step, action, service, reason, diagnosis, result, time.time()),
+            )
+
+    def recovery_actions(self, experiment_id: str) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM recovery_actions WHERE experiment_id = ? ORDER BY step, id", (experiment_id,))
+        return [dict(r) for r in rows]
 
     def traces(self, limit: int = 20):
         rows = self.conn.execute("SELECT * FROM agent_trace ORDER BY id DESC LIMIT ?", (limit,))

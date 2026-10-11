@@ -17,6 +17,8 @@ flowchart LR
     WD[Watchdog 1 s]
     SA[Safety agent<br/>pre-flight review, live advisory]
     INJ[Injector + ledger]
+    IA[Injection agent<br/>deterministic verification]
+    RA[Recovery agent<br/>after the rollback, guarded menu]
     RP[Reaper<br/>always on]
     AG[LangGraph agents<br/>planner, validator, analyst, fixer]
     DB[(SQLite)]
@@ -27,7 +29,10 @@ flowchart LR
   CLI --> AG
   AG <--> LLM
   SA <--> LLM
-  CLI --> INJ --> DK
+  CLI --> IA --> INJ --> DK
+  CLI --> RA
+  RA <--> LLM
+  RA -->|restart service, reapply revert| DK
   DK -. crash / netem sidecar .-> SVC
   INJ -. spike: Locust swarm API .-> LG[load-generator]
   PRB --> FP
@@ -50,6 +55,8 @@ flowchart LR
 
 ## How the AI makes decisions
 
+Six agents: Planner, Safety, Injection, Recovery, Analyst and Fixer (plus a rule-based validator). Injection is deterministic and has no model. Recovery only diagnoses and remediates after the deterministic rollback, from a safe menu; the rollback itself is never an LLM decision.
+
 ```mermaid
 flowchart TD
   M[Dependency map<br/>Compose + Jaeger traces] --> C[Candidate faults<br/>allowed targets x fault types]
@@ -63,7 +70,11 @@ flowchart TD
   V -->|reject: try next candidate| V
   V -->|ok| PR[Pre-flight safety review<br/>approve, reduce, veto]
   PR -->|veto: next candidate| V
-  PR -->|approve or reduce| X[Execute under safety layers]
+  PR -->|approve or reduce| IJ[Injection agent<br/>apply, then verify each part]
+  IJ -->|verified| X[Observe under safety layers,<br/>revert, measure recovery]
+  IJ -->|not verified: revert own entries, abort| R
+  X -->|recovery failed| RC[Recovery agent<br/>diagnose, guarded action, re-measure]
+  RC --> R
   X --> R[Record outcome, recovery, climb decision]
   R -->|survived 2 at tier: climb| M
   R -->|abort: exclude target| M
@@ -81,7 +92,9 @@ flowchart TD
 6. **Risk ladder.** A run starts at tier 1 and climbs one tier after 2 survived experiments. Tier 1: delays up to 50 ms, crashes of services no journey needs. Tier 2: 300 ms delay, 10 % loss, traffic spikes (`spike_tier`), partial-impact crashes. Tier 3: crashes of critical or stateful services, including flagd. An aborted experiment excludes its target for the rest of the run.
 7. **Analyze and fix.** The analyst ranks weaknesses using measured impact, breadth and recovery; the fixer proposes a fix for each. Proposed Compose overrides are checked (only restart, healthcheck and deploy keys are accepted). Generating the report never applies anything.
 8. **Verify a fix.** `faultline fix` applies the restart-policy and raised memory or CPU limit part of a config fix to one running, allowlisted container through the Docker API (no `docker compose`), after writing the original HostConfig values to the `fixes` table. It waits for the container to be stable, re-runs the same experiments through the normal guarded path, compares mean penalty before and after (IMPROVED, NO CHANGE, WORSE, or INCONCLUSIVE) and keeps the fix only on IMPROVED, otherwise restoring the originals. Fixes are not fault-ledger entries: the reaper and the kill switch never revert them, `fix --revert-all` does. Healthcheck, replica, code and architecture changes remain proposals.
-9. **Fallback path.** Every agent has a deterministic fallback used when there is no key, the call fails or times out, the response does not parse, or the daily budget is spent. The run result records whether each step used the LLM or the fallback.
+9. **Inject and verify (Injection agent, deterministic).** The approved, possibly reduced, plan is turned into an injection spec by the `inject` node of the run graph and applied by the shared experiment runner (`experiment` uses the same code): ledger write-ahead for all parts, then apply in the safe order (spike, delay or loss, crash). The agent then checks every part took effect: netem present in the target's network namespace with its sidecar running, the crashed container not running, Locust `user_count` at `spike_fraction` (80 %) of the target within `spike_timeout_s`. If a part is not seen in effect, only this experiment's own ledger entries are reverted and the experiment is ABORTED with `abort_source = inject` and `injection not verified: ...`. It has no model; its `agent_trace` row says `deterministic`.
+10. **Recover (Recovery agent, LLM only on failure).** The deterministic rollback and recovery measurement are unchanged. The agent runs after them. If recovery succeeded it makes no call and records `recovered in X s`. If recovery was measured and failed, `openai/gpt-oss-20b` (reasoning effort low, cache off) gets the still-degraded journeys, a revert check per own ledger entry, container state, health and restarts of the target and the journey services, and recent Docker events, and returns a diagnosis, one action and a reason. The menu is `reapply_revert`, `restart_target`, `restart_service`, `kill_switch`, `escalate`. Code enforces it: a service restart only for an allowlisted application service on a degraded journey, never tooling, observability or `astronomy-db`, `valkey-cart`, `kafka` (unless it is the experiment's own target); at most `max_actions` (2) actions, each followed by `settle_s` and a new recovery measurement; every action stored in `recovery_actions` and `agent_trace`. A failed, slow, keyless or invalid LLM answer is `escalate`: nothing is done and the operator gets a message. After an operator stop the agent does nothing. The first failed recovery stays visible in the experiment record and report; scoring uses the final measured recovery, counted from the original revert.
+11. **Fallback path.** Every agent has a deterministic fallback used when there is no key, the call fails or times out, the response does not parse, or the daily budget is spent. The run result records whether each step used the LLM or the fallback.
 
 Budget control: a shared request limiter, a per-model token bucket (8000 tokens/min), a per-model daily budget (180,000 tokens), and a 6 h response cache. `agents usage` and `agents trace` expose all of it.
 
@@ -98,6 +111,8 @@ Layers are independent: a failure of one (including the LLM) does not remove the
 | Write-ahead ledger | Controller dies after or during apply | Unit tests (`tests/test_ledger.py`); used by the kill switch and reaper |
 | Watchdog (1 s) | Journey error rate or p95 beyond baseline-derived thresholds; loss of observability (no samples for 5 s) | Live: cart crash aborted at p95 3007 ms |
 | Pre-flight safety review | An experiment that looks likely to breach limits or repeat a known abort, before anything is injected | Can only approve, lower intensity or veto; a failed review approves and the layers below still apply |
+| Injection agent (deterministic) | An injection that did not take effect (netem missing, container still running, Locust users not reached) running as if it had | Unit tests with a fake driver (`tests/test_injection.py`); unverified injection reverts only its own entries and aborts with source inject |
+| Recovery agent (guarded) | A system that did not return to baseline after the rollback | Acts only after the deterministic revert and measurement; closed menu, service allowlist, no tooling or data stores, 2 actions, re-measure after each, failure means escalate (`tests/test_recovery.py`) |
 | Safety agent (live) | Harm outside the predicted blast radius or a worsening trend, checked about every 10 s | Advisory only; can abort, cannot continue past a watchdog abort; slow or failed checks are ignored |
 | Kill switch | Operator wants everything undone now | Live: `faultline stop` plus STOP sentinel |
 | Reaper | Controller crash or hang; expired faults | Live: reverted stale-heartbeat faults (measured 13 s) |
@@ -134,5 +149,7 @@ SQLite (a Docker volume) holds probe samples, baselines, the ledger, the control
 | Pinned upstream app via git submodule, tweaks in `compose.override.yaml` | Reproducible results; no edits under `vendor/` |
 | Thresholds derived from a measured baseline, with floors | Avoids tripping on normal noise and avoids a limit too loose to protect anything |
 | A combo is one experiment with one ledger entry per part | Reuses the single-experiment watchdog, review, kill switch, reaper and `revert_experiment` unchanged; the report and memory score it as a unit, never as separate single faults |
+| Injection is verified by a deterministic agent, not trusted blindly | A successful Docker call does not prove the fault is in effect; the check is cheap, needs no LLM and fails safe by reverting |
+| The recovery agent only acts after the deterministic rollback, from a closed menu | The rollback stays the safety mechanism; the agent only diagnoses and remediates what the rollback could not fix, and "do nothing" is its default |
 | Fixes are proposed; only restart-policy and raised memory or CPU limit fixes can be applied, by an explicit command | A human confirms the change, only reversible Docker API updates are used, and the result is verified by re-running the same experiment |
 | Fixes live in their own table, not in the fault ledger | A fix is meant to persist after the experiment: the reaper and kill switch must not undo it, and an open ledger entry would block every experiment |
